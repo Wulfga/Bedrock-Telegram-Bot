@@ -1,0 +1,16 @@
+# Geheimnisse und lokale Konfiguration
+.env
+*.env
+!config.example.env
+
+# Laufzeitdaten
+stats.db
+*.db
+*.tar.gz
+*.zip
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc

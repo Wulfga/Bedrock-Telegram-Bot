@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram Bot fuer Minecraft Bedrock Server
+After=network-online.target minecraft-bedrock.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/telegram-bedrock-bot
+EnvironmentFile=/opt/telegram-bedrock-bot/.env
+ExecStart=/opt/telegram-bedrock-bot/venv/bin/python3 /opt/telegram-bedrock-bot/bot.py
+Restart=on-failure
+RestartSec=5
+# Läuft als root, damit "systemctl restart minecraft-bedrock" funktioniert.
+# Alternative (empfohlen für mehr Sicherheit): eigener User + sudoers-Regel,
+# siehe README.md Abschnitt "Sicherheit".
+User=root
+
+[Install]
+WantedBy=multi-user.target
