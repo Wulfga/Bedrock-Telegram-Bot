@@ -12,7 +12,7 @@ Ein Telegram-Bot, der einen Minecraft Bedrock Server überwacht und per Chat ste
 | `/spieler` | Wer ist gerade online, mit der bisherigen Dauer der Sitzung |
 | `/playtime <Name>` | Gesamtspielzeit eines Spielers (eine laufende Sitzung wird mitgezählt) |
 | `/top` | Rangliste der Top 5 nach Spielzeit |
-| `/error [warn] [anzahl]` | Fehler seit dem letzten Serverstart aus dem Server-Log, gleiche Meldungen zusammengefasst (`/error warn` zeigt die Warnungen, `/error 30` mehr Einträge) |
+| `/error [warn] [anzahl]` | Fehler seit dem letzten Serverstart aus dem Server-Log, gleichartige Meldungen zu Gruppen mit Anzahl zusammengefasst, häufigste zuerst (`/error warn` zeigt die Warnungen, `/error 30` mehr Einträge) |
 | `/help` | Übersicht aller Befehle |
 
 ### Steuerung (`ALLOWED_USER_IDS`)

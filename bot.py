@@ -41,7 +41,6 @@ import tempfile
 import time
 import urllib.request
 import zipfile
-from collections import deque
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
@@ -144,7 +143,10 @@ last_error_line: str | None = None
 server_version: str | None = None  # aus der Startzeile im Server-Log
 server_booting = False  # True zwischen "Version:"-Zeile und "Server started."
 # Seit dem letzten Serverstart gesammelte Log-Meldungen (für /error)
-log_issues: dict[str, deque] = {"error": deque(maxlen=300), "warn": deque(maxlen=300)}
+# Gleichartige Meldungen werden zu einer Gruppe zusammengefasst:
+#   Vorlage -> {"count": Anzahl, "example": erste Originalzeile}
+log_issues: dict[str, dict[str, dict]] = {"error": {}, "warn": {}}
+MAX_ISSUE_GROUPS = 300
 log_issue_counts: dict[str, int] = {"error": 0, "warn": 0}
 startup_issue_counts: dict[str, int] = {"error": 0, "warn": 0}
 
@@ -249,8 +251,23 @@ def reset_log_issues():
         startup_issue_counts[kind] = 0
 
 
+def issue_template(line: str) -> str:
+    """Macht aus einer Logzeile eine Vorlage, indem Zeitstempel und veränderliche
+    Teile (Namen in Anführungszeichen, Zahlen) ersetzt werden. So landen z.B.
+    hunderte Rezept-Fehler mit unterschiedlichem Rezeptnamen in einer Gruppe."""
+    text = ERROR_TIMESTAMP_RE.sub("[", strip_log_prefix(line), count=1)
+    text = re.sub(r'"[^"]*"', '"…"', text)
+    text = re.sub(r"'[^']*'", "'…'", text)
+    return re.sub(r"\b\d+\b", "#", text)
+
+
 def record_log_issue(kind: str, line: str):
-    log_issues[kind].append(line)
+    template = issue_template(line)
+    groups = log_issues[kind]
+    if template not in groups and len(groups) >= MAX_ISSUE_GROUPS:
+        template = "(weitere abweichende Meldungen)"
+    group = groups.setdefault(template, {"count": 0, "example": ERROR_TIMESTAMP_RE.sub("[", strip_log_prefix(line), count=1)})
+    group["count"] += 1
     log_issue_counts[kind] += 1
     if server_booting:
         startup_issue_counts[kind] += 1
@@ -710,20 +727,20 @@ async def cmd_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Gleiche Meldungen (ohne Zeitstempel) zusammenfassen, neueste zuletzt
-    grouped: dict[str, int] = {}
-    for line in log_issues[kind]:
-        key = ERROR_TIMESTAMP_RE.sub("[", strip_log_prefix(line), count=1)
-        grouped[key] = grouped.get(key, 0) + 1
-        grouped[key] = grouped.pop(key)  # ans Ende = zuletzt aufgetreten
-    items = list(grouped.items())[-limit:]
+    # Häufigste Gruppen zuerst
+    groups = sorted(log_issues[kind].items(), key=lambda kv: kv[1]["count"], reverse=True)
+    shown = groups[:limit]
 
-    lines = [f"{'🔴' if kind == 'error' else '🟡'} {label} seit dem letzten Serverstart: {total}"]
-    if len(grouped) > len(items):
-        lines.append(f"(zeige die letzten {len(items)} von {len(grouped)} verschiedenen)")
-    for text, count in items:
-        suffix = f"  (x{count})" if count > 1 else ""
-        lines.append("• " + text[:220] + suffix)
+    lines = [f"{'🔴' if kind == 'error' else '🟡'} {label} seit dem letzten Serverstart: {total} "
+             f"({len(groups)} verschiedene Meldungen)"]
+    for template, group in shown:
+        if group["count"] > 1:
+            lines.append(f"• {template[:200]}  (x{group['count']})")
+            lines.append(f"   z.B. {group['example'][:200]}")
+        else:
+            lines.append("• " + group["example"][:220])
+    if len(groups) > len(shown):
+        lines.append(f"... und {len(groups) - len(shown)} weitere Meldungen (/error {min(limit + 15, 50)})")
     if other:
         lines.append(f"\n{other} {other_label}: {hint}")
 
