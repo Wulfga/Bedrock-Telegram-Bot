@@ -27,11 +27,12 @@ Ein Telegram-Bot, der einen Minecraft Bedrock Server überwacht und per Chat ste
 | Befehl | Was er macht |
 |---|---|
 | `/update` | Prüft bei Mojang die neueste Linux-Version. Ist sie neuer als die laufende: laden, Countdown, Server stoppen, Backup, einspielen, Server starten. Ist sie gleich, passiert nichts. |
+| `/reinstall` | Spielt die aktuell laufende Version neu ein (z. B. um beschädigte oder veraltete Programm-/Pack-Dateien zu reparieren). Gleicher Ablauf und gleiche Sicherungen wie `/update`. |
 | `/restore` | Zeigt die vorhandenen Backups |
 | `/restore latest` | Spielt das neueste Backup ein |
 | `/restore <dateiname>` | Spielt ein bestimmtes Backup ein |
 
-Beide Befehle erzeugen vor dem Eingriff automatisch ein Backup des aktuellen Stands. Bei `/update` bleiben `worlds/`, `permissions.json`, `allowlist.json` und `server.properties` unangetastet (`UPDATE_PROTECTED_PATHS`). Die Standard-Packs (`behavior_packs/`, `resource_packs/`) werden bewusst mitaktualisiert, weil sie zur Serverversion passen müssen. Selbst hinzugefügte Packs bleiben erhalten, denn das Update überschreibt nur Dateien aus der ZIP und löscht nichts.
+`/update`, `/reinstall` und `/restore` erzeugen vor dem Eingriff automatisch ein Backup des aktuellen Stands. Bei `/update` bleiben `worlds/`, `permissions.json`, `allowlist.json` und `server.properties` unangetastet (`UPDATE_PROTECTED_PATHS`). Die Standard-Packs (`behavior_packs/`, `resource_packs/`) werden bewusst mitaktualisiert, weil sie zur Serverversion passen müssen. Selbst hinzugefügte Packs bleiben erhalten, denn das Update überschreibt nur Dateien aus der ZIP und löscht nichts.
 
 ### Automatische Funktionen
 
@@ -52,7 +53,9 @@ Beide Befehle erzeugen vor dem Eingriff automatisch ein Backup des aktuellen Sta
 - Zwei Berechtigungsstufen: `/restart` und `/backup` für `ALLOWED_USER_IDS`, `/update` und `/restore` nur für `ADMIN_USER_IDS`. Unberechtigte bekommen eine Absage.
 - Backup **vor** jedem Update und jeder Wiederherstellung, bei gestopptem Server.
 - Bricht ein Schritt ab (Backup, Entpacken, Start), bleibt der Server gestoppt und der Bot meldet den Fehler, statt mit einem halben Zustand weiterzumachen.
-- Schlägt der Download beim Update fehl, wird der Server gar nicht erst angefasst.
+- Schlägt der Download beim Update fehl, wird der Server gar nicht erst angefasst. Die ZIP wird vor dem Stoppen auf Vollständigkeit geprüft, ein abgebrochener Download hinterlässt keine halbe Datei.
+- Das Backup wird geprüft (lesbar, enthält `worlds/`), bevor der Bot irgendetwas überschreibt. Fehlt `worlds/` danach, startet der Server nicht.
+- Nach erfolgreichem Update oder erfolgreicher Neuinstallation löscht der Bot ältere heruntergeladene Server-ZIPs in `UPDATE_DIR`. Die aktuelle bleibt liegen.
 - Alle Einstellungen, auch Token und IDs, liegen in einer `.env` außerhalb der Versionsverwaltung.
 
 Hinweis zu den Rechten: Die Abfragen sind nicht auf die Gruppe beschränkt. Wer dem Bot schreiben kann, bekommt dort Status, Spielerliste und Statistiken. Steuern können nur die eingetragenen User-IDs.

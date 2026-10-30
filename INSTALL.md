@@ -189,7 +189,15 @@ Liegen bei dir weitere Dateien, die erhalten bleiben sollen, hänge sie kommaget
 
 Schlägt Backup oder Entpacken fehl, **bleibt der Server bewusst gestoppt** und der Bot meldet den Fehler in der Gruppe. Das Backup ist dann vorhanden. Während Update, Restore und Neustart pausiert die Offline-Erkennung (kein Fehlalarm).
 
+**Alte ZIPs:** Nach einem erfolgreichen Update löscht der Bot ältere `bedrock-server-*.zip` in `UPDATE_DIR`; die aktuelle bleibt liegen (sie wird für `/reinstall` gebraucht). Die ZIP wird vor dem Stoppen des Servers auf Vollständigkeit geprüft, und das Backup muss `worlds/` enthalten, sonst bricht der Bot ab.
+
 Vor dem allerersten `/update` einmal `/backup` auslösen und prüfen, dass die Datei in `BACKUP_DIR` liegt.
+
+### Neuinstallation (`/reinstall`, nur `ADMIN_USER_IDS`)
+
+Spielt die **aktuell laufende Version** noch einmal ein, ohne die Version zu wechseln. Sinnvoll, wenn Programm- oder Pack-Dateien beschädigt oder veraltet sind. Ablauf und Schutz sind wie bei `/update`: Countdown, Server stoppen, Backup (mit Prüfung auf `worlds/`), ZIP einspielen (`UPDATE_PROTECTED_PATHS` bleiben unangetastet), Server starten. Die ZIP kommt aus `UPDATE_DIR`; fehlt sie, lädt der Bot sie von Mojang nach, sofern Mojang noch genau diese Version anbietet. Sonst bricht er ab, ohne den Server anzufassen.
+
+Dateien, die nicht in der ZIP stehen (z. B. eigene Packs), werden weder überschrieben noch gelöscht.
 
 ### Restore (`/restore`, nur `ADMIN_USER_IDS`)
 

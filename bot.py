@@ -10,6 +10,8 @@ Befehle:
   /update    - Prüft automatisch auf neue Version, lädt sie herunter und
                installiert sie: Stop, Backup, Update, Start - worlds/Configs
                bleiben erhalten (nur ADMIN_USER_IDS)
+  /reinstall - Spielt die installierte Version neu ein (Backup vorher, Welten/Configs
+               bleiben erhalten; nur ADMIN_USER_IDS)
   /restore   - Stellt ein Backup wieder her, überschreibt worlds/Configs
                (nur ADMIN_USER_IDS)
   /playtime  - Spielzeit eines Spielers anzeigen: /playtime <Name>
@@ -487,8 +489,17 @@ async def fetch_latest_linux_info() -> tuple[str, str]:
 def _download_file(url: str, dest_path: str):
     req = urllib.request.Request(url, headers={"User-Agent": BEDROCK_DOWNLOAD_USER_AGENT})
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    with urllib.request.urlopen(req, timeout=180) as resp, open(dest_path, "wb") as f:
-        shutil.copyfileobj(resp, f)
+    # Erst in eine .part-Datei laden und am Ende umbenennen: ein abgebrochener
+    # Download hinterlässt sonst eine kaputte ZIP, die beim nächsten Mal
+    # als "schon vorhanden" wiederverwendet würde.
+    part_path = dest_path + ".part"
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp, open(part_path, "wb") as f:
+            shutil.copyfileobj(resp, f)
+        os.replace(part_path, dest_path)
+    finally:
+        if os.path.exists(part_path):
+            os.remove(part_path)
 
 
 async def download_file(url: str, dest_path: str):
@@ -496,6 +507,59 @@ async def download_file(url: str, dest_path: str):
 
 
 # --- Update-Logik --------------------------------------------------------
+def _validate_server_zip(zip_path: str):
+    """Prüft vor dem Stoppen des Servers, ob die ZIP vollständig und ein
+    Bedrock-Server-Archiv ist. Wirft eine Exception, wenn nicht."""
+    if not zipfile.is_zipfile(zip_path):
+        raise RuntimeError("keine gültige ZIP-Datei")
+    with zipfile.ZipFile(zip_path) as zf:
+        bad = zf.testzip()
+        if bad is not None:
+            raise RuntimeError(f"beschädigte Datei im Archiv: {bad}")
+        if "bedrock_server" not in zf.namelist():
+            raise RuntimeError("enthält keine Datei 'bedrock_server'")
+
+
+async def validate_server_zip(zip_path: str):
+    await asyncio.get_event_loop().run_in_executor(None, _validate_server_zip, zip_path)
+
+
+def _verify_backup_has_worlds(backup_path: str):
+    """Stellt sicher, dass das Backup lesbar ist und (falls vorhanden) worlds/
+    enthält. Wirft eine Exception, wenn nicht."""
+    if os.path.getsize(backup_path) == 0:
+        raise RuntimeError("Backup-Datei ist leer")
+    if not os.path.isdir(os.path.join(SERVER_DIR, "worlds")):
+        return  # nichts zu prüfen
+    with tarfile.open(backup_path, "r:gz") as tf:
+        for name in tf.getnames():
+            if name.lstrip("./").startswith("worlds/"):
+                return
+    raise RuntimeError("worlds/ fehlt im Backup")
+
+
+async def verify_backup_has_worlds(backup_path: str):
+    await asyncio.get_event_loop().run_in_executor(None, _verify_backup_has_worlds, backup_path)
+
+
+def cleanup_old_update_zips(keep_path: str) -> int:
+    """Löscht alle heruntergeladenen Server-ZIPs (und angebrochene Downloads)
+    in UPDATE_DIR außer keep_path. Gibt die Anzahl gelöschter Dateien zurück."""
+    removed = 0
+    keep = os.path.abspath(keep_path)
+    for pattern in ("bedrock-server-*.zip", "bedrock-server-*.zip.part"):
+        for path in glob.glob(os.path.join(UPDATE_DIR, pattern)):
+            if os.path.abspath(path) == keep:
+                continue
+            try:
+                os.remove(path)
+                removed += 1
+                log.info("Alte Update-Datei gelöscht: %s", path)
+            except OSError as e:
+                log.error("Konnte %s nicht löschen: %s", path, e)
+    return removed
+
+
 def _do_extract_update(zip_path: str):
     """Entpackt zip_path und kopiert alles außer UPDATE_PROTECTED_PATHS
     nach SERVER_DIR. Läuft blockierend, daher im Executor aufrufen."""
@@ -562,52 +626,77 @@ async def do_start_service(notify) -> bool:
         maintenance_mode = False
 
 
-async def perform_update_sequence(zip_path: str, seconds: int, notify):
+async def perform_update_sequence(zip_path: str, seconds: int, notify, reinstall: bool = False):
+    """Update (neue Version) oder Neuinstallation (gleiche Version) aus zip_path.
+    Ablauf: ZIP prüfen, Countdown, Server stoppen, Backup (inkl. worlds/) anlegen
+    und prüfen, entpacken (geschützte Pfade bleiben), Server starten, alte ZIPs löschen."""
+    global maintenance_mode
     zip_name = os.path.basename(zip_path)
+    word = "Neuinstallation" if reinstall else "Update"
+    before = "vor der Neuinstallation" if reinstall else "vor dem Update"
 
-    await perform_countdown(seconds, notify, f"Server-Update ({zip_name})")
+    # Vor dem Stoppen prüfen: eine kaputte ZIP darf den Server nie lahmlegen
+    try:
+        await validate_server_zip(zip_path)
+    except Exception as e:
+        log.error("ZIP-Prüfung fehlgeschlagen (%s): %s", zip_name, e)
+        try:
+            os.remove(zip_path)  # defekte Datei nicht wiederverwenden
+        except OSError:
+            pass
+        await notify(
+            f"❌ `{zip_name}` ist unbrauchbar ({e}) und wurde gelöscht. "
+            f"Server wurde nicht angefasst - bitte {word} erneut starten."
+        )
+        return
+
+    await perform_countdown(seconds, notify, f"Server-{word} ({zip_name})")
 
     await notify("🛑 Stoppe Server ...")
     if not await do_stop_service(notify):
         return
 
-    await notify("💾 Erstelle Backup vor dem Update ...")
+    had_worlds = os.path.isdir(os.path.join(SERVER_DIR, "worlds"))
+
+    await notify(f"💾 Erstelle Backup {before} ...")
     try:
         backup_path, backup_size = await run_backup()
+        await verify_backup_has_worlds(backup_path)
         await notify(
-            f"✅ Backup fertig: `{os.path.basename(backup_path)}` "
+            f"✅ Backup fertig und geprüft: `{os.path.basename(backup_path)}` "
             f"({backup_size / (1024*1024):.1f} MB)",
         )
     except Exception as e:
-        log.error("Backup vor Update fehlgeschlagen: %s", e)
-        global maintenance_mode
+        log.error("Backup vor %s fehlgeschlagen: %s", word, e)
         maintenance_mode = False
         await notify(
-            f"❌ Backup fehlgeschlagen ({e}) - Update wird abgebrochen, "
+            f"❌ Backup fehlgeschlagen ({e}) - {word} wird abgebrochen, "
             "Server bleibt aus Sicherheitsgründen gestoppt. Bitte manuell prüfen."
         )
         return
 
-    await notify(
-        "📦 Entpacke Update - `worlds/`, `permissions.json`, `allowlist.json`, "
-        "`server.properties`, Resource-/Behavior-Packs bleiben unangetastet ..."
-    )
+    protected = ", ".join(f"`{p}`" for p in UPDATE_PROTECTED_PATHS)
+    await notify(f"📦 Spiele die Dateien aus der ZIP ein - unangetastet bleiben: {protected} ...")
     try:
         await run_extract_update(zip_path)
+        if had_worlds and not os.path.isdir(os.path.join(SERVER_DIR, "worlds")):
+            raise RuntimeError("worlds/ ist nach dem Entpacken nicht mehr vorhanden")
     except Exception as e:
-        log.error("Update-Entpacken fehlgeschlagen: %s", e)
+        log.error("%s-Entpacken fehlgeschlagen: %s", word, e)
         maintenance_mode = False
         await notify(
-            f"❌ Update fehlgeschlagen beim Entpacken ({e}). "
+            f"❌ {word} fehlgeschlagen beim Entpacken ({e}). "
             "Server bleibt gestoppt - Backup ist vorhanden, bitte manuell prüfen."
         )
         return
 
-    await notify("🚀 Starte Server mit neuer Version ...")
+    await notify("🚀 Starte Server ...")
     if not await do_start_service(notify):
         return
 
-    await notify("✅ Update abgeschlossen und Server läuft wieder.")
+    removed = cleanup_old_update_zips(zip_path)
+    cleanup_note = f" {removed} alte Update-Datei(en) gelöscht." if removed else ""
+    await notify(f"✅ {word} abgeschlossen und Server läuft wieder.{cleanup_note}")
 
 
 # --- Restore-Logik -----------------------------------------------------------
@@ -838,6 +927,58 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await perform_update_sequence(zip_path, RESTART_COUNTDOWN_SECONDS, notify)
 
 
+async def cmd_reinstall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/reinstall - installiert die aktuell laufende Version neu (repariert z.B.
+    beschädigte oder veraltete Programm-/Pack-Dateien). Gleiche Sicherungen wie /update."""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("⛔ Nur Admins dürfen den Server neu installieren.")
+        return
+
+    version = server_version
+    if not version:
+        await update.message.reply_text(
+            "❌ Installierte Version unbekannt (steht nicht im Server-Log). "
+            "Mit /update auf die neueste Version gehen."
+        )
+        return
+
+    zip_path = os.path.join(UPDATE_DIR, f"bedrock-server-{version}.zip")
+    if os.path.isfile(zip_path):
+        await update.message.reply_text(f"📦 Nutze vorhandene Datei für Version `{version}`.",
+                                        parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(f"🔍 Suche Version `{version}` bei Mojang ...",
+                                        parse_mode=ParseMode.MARKDOWN)
+        try:
+            latest_url, latest_version = await fetch_latest_linux_info()
+        except Exception as e:
+            log.error("Versionsabfrage fehlgeschlagen: %s", e)
+            await update.message.reply_text(f"❌ Konnte Mojang nicht abfragen: {e}")
+            return
+        if not versions_match(version, latest_version):
+            await update.message.reply_text(
+                f"❌ Für `{version}` liegt keine ZIP in `{UPDATE_DIR}`, und Mojang bietet nur "
+                f"`{latest_version}` an. Mit /update auf `{latest_version}` gehen oder die "
+                "ZIP dort ablegen.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        zip_path = os.path.join(UPDATE_DIR, f"bedrock-server-{latest_version}.zip")
+        try:
+            await download_file(latest_url, zip_path)
+            await update.message.reply_text("✅ Download fertig.")
+        except Exception as e:
+            log.error("Download fehlgeschlagen: %s", e)
+            await update.message.reply_text(f"❌ Download fehlgeschlagen: {e}")
+            return
+
+    async def notify(text: str):
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+    await perform_update_sequence(zip_path, RESTART_COUNTDOWN_SECONDS, notify, reinstall=True)
+
+
 async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
@@ -931,6 +1072,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/update - Prüft automatisch auf die neueste Version, lädt sie herunter "
         "und installiert sie: Stop, Backup, Entpacken "
         "(worlds/Configs bleiben erhalten), Start (nur Admins)\n"
+        "/reinstall - Installierte Version neu einspielen (Backup vorher, Welten bleiben; nur Admins)\n"
         "/restore [datei|latest] - Backup wiederherstellen, überschreibt "
         "worlds/Configs (nur Admins)\n"
         "/playtime <Name> - Spielzeit eines Spielers\n"
@@ -1198,6 +1340,7 @@ def main():
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("update", cmd_update))
+    app.add_handler(CommandHandler("reinstall", cmd_reinstall))
     app.add_handler(CommandHandler("restore", cmd_restore))
     app.add_handler(CommandHandler("playtime", cmd_playtime))
     app.add_handler(CommandHandler("top", cmd_top))
