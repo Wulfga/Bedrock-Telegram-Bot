@@ -12,6 +12,7 @@ Ein Telegram-Bot, der einen Minecraft Bedrock Server überwacht und per Chat ste
 | `/spieler` | Wer ist gerade online, mit der bisherigen Dauer der Sitzung |
 | `/playtime <Name>` | Gesamtspielzeit eines Spielers (eine laufende Sitzung wird mitgezählt) |
 | `/top` | Rangliste der Top 5 nach Spielzeit |
+| `/error [warn] [anzahl]` | Fehler seit dem letzten Serverstart aus dem Server-Log, gleiche Meldungen zusammengefasst (`/error warn` zeigt die Warnungen, `/error 30` mehr Einträge) |
 | `/help` | Übersicht aller Befehle |
 
 ### Steuerung (`ALLOWED_USER_IDS`)
@@ -37,7 +38,8 @@ Beide Befehle erzeugen vor dem Eingriff automatisch ein Backup des aktuellen Sta
 | Funktion | Verhalten | Einstellung |
 |---|---|---|
 | Join/Leave-Meldung | Push in die Gruppe mit Spielernamen: „🟢 Name ist dem Server beigetreten“ bzw. „🔴 Name hat den Server verlassen (Session: 1h 20m)“ | `LOG_MODE` |
-| Fehler-Alarm | Meldet Zeilen mit `ERROR`, `Exception` oder `FATAL` aus dem Server-Log; unmittelbar aufeinanderfolgende gleiche Meldungen (ohne Zeitstempel verglichen) werden nur einmal gemeldet | `LOG_MODE` |
+| Startzusammenfassung | Nach jedem Serverstart eine Zeile mit Version und Anzahl der Fehler/Warnungen beim Start („keine Fehler oder Warnungen“ oder Verweis auf `/error`). Einzelne Meldungen beim Start werden nicht in die Gruppe geschickt. | `LOG_MODE` |
+| Fehler-Alarm | Fehler, die nach dem Start im Server-Log auftauchen, werden einzeln gemeldet; unmittelbar aufeinanderfolgende gleiche Meldungen (ohne Zeitstempel verglichen) nur einmal. Warnungen werden nur gesammelt. | `LOG_MODE`, `ERROR_ALERTS_RUNTIME` |
 | Ausfall-Erkennung | Meldet, wenn der Serverdienst nicht mehr läuft (z. B. Absturz) und wenn er wieder online ist. Pausiert während Neustart, Update und Restore, damit es keinen Fehlalarm gibt. | `POLL_INTERVAL` |
 | Automatisches Backup | Sichert in festem Abstand (gerechnet ab Bot-Start) und meldet das Ergebnis in die Gruppe. Alte Backups werden aufgeräumt. | `BACKUP_INTERVAL_HOURS`, `BACKUP_RETENTION_COUNT`, `BACKUP_DIR` |
 | Geplanter Neustart | Optional: täglicher Neustart zu fester Uhrzeit mit Countdown, auf Wunsch übersprungen, wenn niemand online ist | `SCHEDULED_RESTART_*` (standardmäßig aus) |

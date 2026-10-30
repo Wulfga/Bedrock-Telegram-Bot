@@ -14,12 +14,13 @@ Befehle:
                (nur ADMIN_USER_IDS)
   /playtime  - Spielzeit eines Spielers anzeigen: /playtime <Name>
   /top       - Top-5-Rangliste nach Spielzeit
+  /error     - Fehler/Warnungen aus dem Server-Log seit dem letzten Start
   /help      - Hilfe
 
 Hintergrund-Tasks:
   - Offline/Online-Erkennung des Servers
   - Live-Log-Watcher: Join/Leave (mit Klarnamen + Spielzeit-Tracking) und
-    Fehler-/Absturz-Erkennung (ERROR/Exception/FATAL im Log)
+    Sammeln von Fehlern/Warnungen (Zusammenfassung beim Serverstart)
   - Automatisches, zeitgesteuertes Backup (BACKUP_INTERVAL_HOURS)
   - Geplanter täglicher Neustart (SCHEDULED_RESTART_ENABLED)
 
@@ -40,6 +41,7 @@ import tempfile
 import time
 import urllib.request
 import zipfile
+from collections import deque
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
@@ -114,6 +116,9 @@ BEDROCK_DOWNLOAD_USER_AGENT = (
 )
 
 # Geplante Neustarts
+# Fehler, die NACH dem Serverstart im Log auftauchen, einzeln in die Gruppe melden.
+# Fehler/Warnungen während des Starts werden nie einzeln gemeldet (siehe /error).
+ERROR_ALERTS_RUNTIME = os.environ.get("ERROR_ALERTS_RUNTIME", "true").lower() in ("1", "true", "yes")
 SCHEDULED_RESTART_ENABLED = os.environ.get("SCHEDULED_RESTART_ENABLED", "false").lower() == "true"
 SCHEDULED_RESTART_HOUR = int(os.environ.get("SCHEDULED_RESTART_HOUR", "4"))
 SCHEDULED_RESTART_MINUTE = int(os.environ.get("SCHEDULED_RESTART_MINUTE", "0"))
@@ -137,11 +142,17 @@ maintenance_mode = False  # True während geplantem Stop/Restart/Update/Restore
 active_sessions: dict[str, float] = {}  # Name -> Unix-Timestamp (Join)
 last_error_line: str | None = None
 server_version: str | None = None  # aus der Startzeile im Server-Log
+server_booting = False  # True zwischen "Version:"-Zeile und "Server started."
+# Seit dem letzten Serverstart gesammelte Log-Meldungen (für /error)
+log_issues: dict[str, deque] = {"error": deque(maxlen=300), "warn": deque(maxlen=300)}
+log_issue_counts: dict[str, int] = {"error": 0, "warn": 0}
+startup_issue_counts: dict[str, int] = {"error": 0, "warn": 0}
 
 JOIN_LEAVE_RE = re.compile(r"Player (connected|disconnected):\s*([^,]+),")
 VERSION_RE = re.compile(r"INFO\] Version:\s*(\d+(?:\.\d+)+)")
 SERVER_STARTED_RE = re.compile(r"INFO\] Server started\.")
 ERROR_RE = re.compile(r"\b(ERROR|Exception|FATAL)\b", re.IGNORECASE)
+LOG_LEVEL_RE = re.compile(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}:\d{3} (INFO|WARN|ERROR)\]")
 ERROR_TIMESTAMP_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}:\d{3} ")
 
 
@@ -219,6 +230,36 @@ def format_duration(seconds: float) -> str:
     if hours:
         return f"{hours}h {minutes}m"
     return f"{minutes}m"
+
+
+# --- Fehler-/Warnungs-Sammlung (für /error) ---------------------------------
+def classify_log_line(line: str) -> str | None:
+    """'error', 'warn' oder None. Maßgeblich ist die Stufe der Logzeile; nur
+    Zeilen ohne Stufe (z.B. Absturzmeldungen) werden am Text erkannt."""
+    level = LOG_LEVEL_RE.search(line)
+    if level:
+        return {"ERROR": "error", "WARN": "warn"}.get(level.group(1))
+    return "error" if ERROR_RE.search(line) else None
+
+
+def reset_log_issues():
+    for kind in ("error", "warn"):
+        log_issues[kind].clear()
+        log_issue_counts[kind] = 0
+        startup_issue_counts[kind] = 0
+
+
+def record_log_issue(kind: str, line: str):
+    log_issues[kind].append(line)
+    log_issue_counts[kind] += 1
+    if server_booting:
+        startup_issue_counts[kind] += 1
+
+
+def strip_log_prefix(line: str) -> str:
+    """Kürzt Journal-Präfix (Datum/Host/Unit) und Zeitstempel für die Anzeige."""
+    match = re.search(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}:\d{3} ", line)
+    return line[match.start():] if match else line
 
 
 # --- Server-Status (für /status und Offline-Erkennung) ---------------------
@@ -634,6 +675,64 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
+def startup_summary_text() -> str:
+    e, w = startup_issue_counts["error"], startup_issue_counts["warn"]
+    head = f"🚀 Server gestartet (Version `{server_version or 'unbekannt'}`)"
+    if e == 0 and w == 0:
+        return head + " - keine Fehler oder Warnungen."
+    parts = []
+    if e:
+        parts.append(f"{e} Fehler")
+    if w:
+        parts.append(f"{w} Warnung" if w == 1 else f"{w} Warnungen")
+    return head + f"\n⚠️ Beim Start: {', '.join(parts)} - Details mit /error"
+
+
+async def cmd_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/error [warn] [anzahl] - gesammelte Fehler (oder Warnungen) seit dem letzten Serverstart."""
+    kind, limit = "error", 15
+    for arg in context.args or []:
+        if arg.lower() in ("warn", "warnings", "warnung", "warnungen", "w"):
+            kind = "warn"
+        elif arg.isdigit():
+            limit = max(1, min(int(arg), 50))
+
+    label = "Fehler" if kind == "error" else "Warnungen"
+    total = log_issue_counts[kind]
+    other = log_issue_counts["warn" if kind == "error" else "error"]
+    other_label = "Warnungen" if kind == "error" else "Fehler"
+    hint = "/error warn" if kind == "error" else "/error"
+
+    if total == 0:
+        await update.message.reply_text(
+            f"✅ Keine {label} seit dem letzten Serverstart."
+            + (f"\n({other} {other_label}: {hint})" if other else "")
+        )
+        return
+
+    # Gleiche Meldungen (ohne Zeitstempel) zusammenfassen, neueste zuletzt
+    grouped: dict[str, int] = {}
+    for line in log_issues[kind]:
+        key = ERROR_TIMESTAMP_RE.sub("[", strip_log_prefix(line), count=1)
+        grouped[key] = grouped.get(key, 0) + 1
+        grouped[key] = grouped.pop(key)  # ans Ende = zuletzt aufgetreten
+    items = list(grouped.items())[-limit:]
+
+    lines = [f"{'🔴' if kind == 'error' else '🟡'} {label} seit dem letzten Serverstart: {total}"]
+    if len(grouped) > len(items):
+        lines.append(f"(zeige die letzten {len(items)} von {len(grouped)} verschiedenen)")
+    for text, count in items:
+        suffix = f"  (x{count})" if count > 1 else ""
+        lines.append("• " + text[:220] + suffix)
+    if other:
+        lines.append(f"\n{other} {other_label}: {hint}")
+
+    out = "\n".join(lines)
+    if len(out) > 4000:
+        out = out[:3990] + "\n..."
+    await update.message.reply_text(out)  # bewusst ohne Markdown (Unterstriche in IDs)
+
+
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USER_IDS:
@@ -805,6 +904,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Verfügbare Befehle:\n"
         "/status - Serverstatus, Spieleranzahl, Version\n"
         "/spieler - Wer ist aktuell online\n"
+        "/error [warn] [anzahl] - Fehler (oder Warnungen) aus dem Server-Log seit dem letzten Start\n"
         "/restart [sekunden] - Neustart mit Countdown (nur berechtigte Nutzer)\n"
         "/backup - Manuelles Backup erstellen (nur berechtigte Nutzer)\n"
         "/update - Prüft automatisch auf die neueste Version, lädt sie herunter "
@@ -876,19 +976,30 @@ async def _iter_log_lines():
 
 
 async def watch_logs(app: Application):
-    global last_error_line, server_version
+    global last_error_line, server_version, server_booting
     while True:
         try:
             log.info("Log-Watcher gestartet (LOG_MODE=%s)", LOG_MODE)
             async for line in _iter_log_lines():
                 version_match = VERSION_RE.search(line)
                 if version_match:
+                    # Erste Zeile eines Serverstarts: Sammlung zurücksetzen
                     server_version = version_match.group(1)
-                if SERVER_STARTED_RE.search(line) and active_sessions:
-                    # Frischer Serverstart: Sessions aus der Zeit davor sind hinfällig
-                    log.info("Server gestartet - verwerfe veraltete Sessions: %s",
-                             ", ".join(active_sessions))
-                    active_sessions.clear()
+                    server_booting = True
+                    reset_log_issues()
+                if SERVER_STARTED_RE.search(line):
+                    if active_sessions:
+                        # Frischer Serverstart: Sessions aus der Zeit davor sind hinfällig
+                        log.info("Server gestartet - verwerfe veraltete Sessions: %s",
+                                 ", ".join(active_sessions))
+                        active_sessions.clear()
+                    if server_booting:
+                        server_booting = False
+                        await app.bot.send_message(
+                            GROUP_CHAT_ID, startup_summary_text(), parse_mode=ParseMode.MARKDOWN,
+                        )
+                    continue
+
                 join_leave = JOIN_LEAVE_RE.search(line)
                 if join_leave:
                     action, name = join_leave.group(1), join_leave.group(2).strip()
@@ -907,7 +1018,14 @@ async def watch_logs(app: Application):
                     await app.bot.send_message(GROUP_CHAT_ID, text, parse_mode=ParseMode.MARKDOWN)
                     continue
 
-                if ERROR_RE.search(line):
+                kind = classify_log_line(line)
+                if kind is None:
+                    continue
+                was_booting = server_booting
+                record_log_issue(kind, line)
+                # Einzelmeldung nur für Fehler nach dem Start (nie für Warnungen
+                # und nie für Meldungen während des Starts)
+                if kind == "error" and not was_booting and ERROR_ALERTS_RUNTIME:
                     # Zeitstempel für den Vergleich entfernen, sonst ist jede
                     # Zeile "neu" und die Unterdrückung von Wiederholungen greift nie
                     normalized = ERROR_TIMESTAMP_RE.sub("[", line, count=1)
@@ -986,17 +1104,23 @@ def bootstrap_active_sessions():
         log.error("Konnte Journal-Historie für Reconciliation nicht lesen: %s", e)
         return
 
-    global server_version
+    global server_version, server_booting
     for line in result.stdout.splitlines():
         version_match = VERSION_RE.search(line)
         if version_match:
             server_version = version_match.group(1)
+            server_booting = True
+            reset_log_issues()
         if SERVER_STARTED_RE.search(line):
             active_sessions.clear()  # Sessions vor einem Neustart sind hinfällig
+            server_booting = False
             continue
 
         match = JOIN_LEAVE_RE.search(line)
         if not match:
+            kind = classify_log_line(line)
+            if kind:
+                record_log_issue(kind, strip_log_prefix(line))
             continue
         action, name = match.group(1), match.group(2).strip()
 
@@ -1049,6 +1173,7 @@ def main():
 
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("spieler", cmd_spieler))
+    app.add_handler(CommandHandler("error", cmd_error))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("update", cmd_update))
