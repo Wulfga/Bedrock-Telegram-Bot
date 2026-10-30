@@ -180,9 +180,10 @@ Ablauf:
 **Diese Pfade werden dabei nie überschrieben** (`UPDATE_PROTECTED_PATHS`):
 
 ```
-worlds, permissions.json, allowlist.json, server.properties,
-resource_packs, behavior_packs, valid_known_packs.json
+worlds, permissions.json, allowlist.json, server.properties
 ```
+
+Die Standard-Packs (`behavior_packs/`, `resource_packs/`, `valid_known_packs.json`) werden **mit aktualisiert**, denn sie enthalten die Spielinhalte (Biome, Rezepte, Items) und müssen zur Serverversion passen. Bleiben sie alt, fehlen neue Inhalte, und der Server meldet beim Start viele Registry-Fehler. Selbst hinzugefügte Packs bleiben erhalten, weil das Update nur Dateien aus der ZIP überschreibt und nichts löscht. Trägst du die Pack-Ordner in `UPDATE_PROTECTED_PATHS` ein, verlierst du diesen Schutz für die Standard-Packs.
 
 Liegen bei dir weitere Dateien, die erhalten bleiben sollen, hänge sie kommagetrennt in der `.env` an. Der Wert in der `.env` ersetzt dabei die gesamte Standardliste, also die Standardeinträge mit angeben.
 

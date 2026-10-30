@@ -31,7 +31,7 @@ Ein Telegram-Bot, der einen Minecraft Bedrock Server überwacht und per Chat ste
 | `/restore latest` | Spielt das neueste Backup ein |
 | `/restore <dateiname>` | Spielt ein bestimmtes Backup ein |
 
-Beide Befehle erzeugen vor dem Eingriff automatisch ein Backup des aktuellen Stands. Bei `/update` bleiben `worlds/`, `permissions.json`, `allowlist.json`, `server.properties` und die Resource-/Behavior-Packs unangetastet (`UPDATE_PROTECTED_PATHS`).
+Beide Befehle erzeugen vor dem Eingriff automatisch ein Backup des aktuellen Stands. Bei `/update` bleiben `worlds/`, `permissions.json`, `allowlist.json` und `server.properties` unangetastet (`UPDATE_PROTECTED_PATHS`). Die Standard-Packs (`behavior_packs/`, `resource_packs/`) werden bewusst mitaktualisiert, weil sie zur Serverversion passen müssen. Selbst hinzugefügte Packs bleiben erhalten, denn das Update überschreibt nur Dateien aus der ZIP und löscht nichts.
 
 ### Automatische Funktionen
 

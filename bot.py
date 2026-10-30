@@ -97,12 +97,16 @@ STATS_DB_PATH = os.environ.get(
 # Versionen (siehe /update). Manuelles Ablegen von .zip-Dateien dort geht
 # weiterhin, falls du eine bestimmte Version statt "latest" installieren willst.
 UPDATE_DIR = os.environ.get("UPDATE_DIR", "/opt/bedrock-updates")
+# Bewusst NICHT geschützt: behavior_packs, resource_packs, valid_known_packs.json.
+# Dort liegen die Spielinhalte (Biome, Features, Rezepte, Items) der Standard-Packs,
+# die zur Serverversion passen müssen. Bleiben sie alt, fehlen neue Inhalte und der
+# Server meldet beim Start hunderte Registry-Fehler. Eigene Packs sind sicher: die
+# ZIP enthält sie nicht, und das Update überschreibt nur Dateien, löscht aber keine.
 UPDATE_PROTECTED_PATHS = [
     p.strip()
     for p in os.environ.get(
         "UPDATE_PROTECTED_PATHS",
-        "worlds,permissions.json,allowlist.json,server.properties,"
-        "resource_packs,behavior_packs,valid_known_packs.json",
+        "worlds,permissions.json,allowlist.json,server.properties",
     ).split(",")
     if p.strip()
 ]
