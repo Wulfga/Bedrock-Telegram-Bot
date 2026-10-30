@@ -246,7 +246,9 @@ systemctl restart telegram-bedrock-bot
 | `KeyError: 'BOT_TOKEN'` im Log | `.env` fehlt, heißt anders (muss `.env` heißen, nicht `config.example.env`) oder der `EnvironmentFile`-Pfad stimmt nicht |
 | Bot antwortet nicht in der Gruppe | Bot in der Gruppe? Token korrekt? `journalctl -u telegram-bedrock-bot -n 50` |
 | `getUpdates` liefert `[]` | Nach dem Hinzufügen des Bots erst einen `/befehl` in der Gruppe senden |
-| `/status` zeigt "offline", Server läuft aber | `SERVER_HOST`/`SERVER_PORT` prüfen, UDP-Port 19132 lokal erreichbar? |
+| `/status` zeigt "offline" | Läuft der Dienst (`systemctl is-active <SERVICE_NAME>`)? Stimmt `SERVICE_NAME` in der `.env`? |
+| `/status` zeigt "Version: unbekannt" | Die Startzeile `Version: ...` fehlt im Journal. Nach einem Neustart des Servers erscheint sie wieder. |
+| `/status` zeigt Warnung zum TCP-Port | Der Server nimmt am `SERVER_PORT` (TCP) keine Verbindungen an. Die Warnung lässt sich mit `STATUS_TCP_CHECK=false` abschalten. |
 | `/spieler` leer, obwohl jemand online ist | Bot wurde nach dem Join neu gestartet: Spieler kurz neu verbinden. Sonst Log-Format prüfen: `journalctl -u minecraft-bedrock \| grep -i "player connected"` |
 | Keine Ingame-Ankündigung beim Neustart | Server läuft nicht über `run-with-fifo.sh` (Abschnitt 4) oder `COMMAND_FIFO_PATH` stimmt nicht |
 | Fehlalarm "Server offline" bei `/update` | Bot-Version prüfen (`git pull`), ältere Versionen kannten den Wartungsmodus nicht |

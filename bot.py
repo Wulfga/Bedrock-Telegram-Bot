@@ -43,7 +43,6 @@ import zipfile
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
-from mcstatus import BedrockServer
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -54,6 +53,9 @@ load_dotenv()
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SERVER_HOST = os.environ.get("SERVER_HOST", "127.0.0.1")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "19132"))
+# Zusätzlicher Erreichbarkeits-Check (TCP) für /status. Seit NetherNet (Bedrock 1.26.51+)
+# läuft der Verbindungsaufbau über TCP auf SERVER_PORT. Nur Anzeige, löst keinen Alarm aus.
+STATUS_TCP_CHECK = os.environ.get("STATUS_TCP_CHECK", "true").lower() in ("1", "true", "yes")
 SERVICE_NAME = os.environ.get("SERVICE_NAME", "minecraft-bedrock")
 SERVER_DIR = os.environ.get("SERVER_DIR", "/opt/bedrock")
 GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])
@@ -134,8 +136,11 @@ server_was_online: bool | None = None
 maintenance_mode = False  # True während geplantem Stop/Restart/Update/Restore
 active_sessions: dict[str, float] = {}  # Name -> Unix-Timestamp (Join)
 last_error_line: str | None = None
+server_version: str | None = None  # aus der Startzeile im Server-Log
 
 JOIN_LEAVE_RE = re.compile(r"Player (connected|disconnected):\s*([^,]+),")
+VERSION_RE = re.compile(r"INFO\] Version:\s*(\d+(?:\.\d+)+)")
+SERVER_STARTED_RE = re.compile(r"INFO\] Server started\.")
 ERROR_RE = re.compile(r"\b(ERROR|Exception|FATAL)\b", re.IGNORECASE)
 ERROR_TIMESTAMP_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}:\d{3} ")
 
@@ -216,21 +221,71 @@ def format_duration(seconds: float) -> str:
     return f"{minutes}m"
 
 
-# --- Server-Abfrage (für /status und Offline-Erkennung) --------------------
-async def query_server():
+# --- Server-Status (für /status und Offline-Erkennung) ---------------------
+# Seit Bedrock 1.26.51 nutzt der Server NetherNet statt RakNet und beantwortet
+# die frühere UDP-Abfrage (mcstatus) nicht mehr. Der Status setzt sich daher
+# aus Quellen zusammen, die vom Netzwerkprotokoll unabhängig sind:
+#   online   -> systemd-Dienst läuft
+#   Spieler  -> Join/Leave-Zeilen im Server-Log (active_sessions)
+#   Version  -> Startzeile "Version: x.y.z.w" im Server-Log
+#   max      -> max-players aus server.properties
+async def _service_is_active() -> bool:
     try:
-        server = BedrockServer(SERVER_HOST, SERVER_PORT)
-        status = await server.async_status()
-        return {
-            "online": True,
-            "players_online": status.players_online,
-            "players_max": status.players_max,
-            "version": status.version.name,
-            "motd": status.motd.raw if status.motd else "",
-        }
+        proc = await asyncio.create_subprocess_exec(
+            "systemctl", "is-active", SERVICE_NAME,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        return out.decode().strip() == "active"
     except Exception as e:
-        log.debug("Server-Abfrage fehlgeschlagen: %s", e)
+        log.warning("systemctl is-active fehlgeschlagen: %s", e)
+        return False
+
+
+async def _tcp_port_open() -> bool:
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(SERVER_HOST, SERVER_PORT), timeout=3
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def read_max_players() -> int | None:
+    try:
+        with open(os.path.join(SERVER_DIR, "server.properties"), encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("max-players="):
+                    return int(line.split("=", 1)[1].strip())
+    except Exception as e:
+        log.debug("max-players nicht lesbar: %s", e)
+    return None
+
+
+async def query_server():
+    """Liefert den Serverstatus oder None, wenn der Dienst nicht läuft."""
+    if not await _service_is_active():
         return None
+    return {
+        "online": True,
+        "players_online": len(active_sessions),
+        "players_max": read_max_players(),
+        "version": server_version,
+        "port_ok": (await _tcp_port_open()) if STATUS_TCP_CHECK else None,
+    }
+
+
+def versions_match(installed: str, latest: str) -> bool:
+    """Vergleicht Versionsnummern mit unterschiedlich vielen Teilen
+    (z.B. '1.26.61' mit '1.26.61.1'), indem auf die kürzere Länge gekürzt wird."""
+    n = min(len(installed.split(".")), len(latest.split(".")))
+    return installed.split(".")[:n] == latest.split(".")[:n]
 
 
 # --- Befehle an die Server-Konsole senden (über FIFO) -----------------------
@@ -562,13 +617,20 @@ async def perform_restore_sequence(backup_path: str, seconds: int, notify):
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     info = await query_server()
     if info is None:
-        await update.message.reply_text("🔴 Server ist offline oder nicht erreichbar.")
+        await update.message.reply_text("🔴 Server ist offline (Dienst läuft nicht).")
         return
+    players_max = info["players_max"] if info["players_max"] is not None else "?"
+    version = info["version"] or "unbekannt"
     text = (
         f"🟢 *Server online*\n"
-        f"Spieler: {info['players_online']}/{info['players_max']}\n"
-        f"Version: {info['version']}"
+        f"Spieler: {info['players_online']}/{players_max}\n"
+        f"Version: `{version}`"
     )
+    if info["port_ok"] is False:
+        text += (
+            f"\n⚠️ Dienst läuft, aber TCP-Port {SERVER_PORT} antwortet nicht - "
+            f"Spieler können evtl. nicht verbinden."
+        )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -629,17 +691,14 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     info = await query_server()
     current_version = info["version"] if info else None
-    # mcstatus liefert nur 3 Versionsteile (z.B. "1.26.45"), die API 4
-    # (z.B. "1.26.45.1") - daher Vergleich auf die ersten 3 Teile beschränkt.
-    latest_short = ".".join(latest_version.split(".")[:3])
 
-    if current_version and current_version == latest_short:
-        await update.message.reply_text(f"✅ Bereits aktuell: Version {current_version}.")
+    if current_version and versions_match(current_version, latest_version):
+        await update.message.reply_text(f"✅ Bereits aktuell: Version `{current_version}`.")
         return
 
     await update.message.reply_text(
         f"⬇️ Lade Version `{latest_version}` herunter"
-        + (f" (aktuell installiert: {current_version})" if current_version else "")
+        + (f" (aktuell installiert: `{current_version}`)" if current_version else "")
         + " ..."
     )
 
@@ -817,11 +876,19 @@ async def _iter_log_lines():
 
 
 async def watch_logs(app: Application):
-    global last_error_line
+    global last_error_line, server_version
     while True:
         try:
             log.info("Log-Watcher gestartet (LOG_MODE=%s)", LOG_MODE)
             async for line in _iter_log_lines():
+                version_match = VERSION_RE.search(line)
+                if version_match:
+                    server_version = version_match.group(1)
+                if SERVER_STARTED_RE.search(line) and active_sessions:
+                    # Frischer Serverstart: Sessions aus der Zeit davor sind hinfällig
+                    log.info("Server gestartet - verwerfe veraltete Sessions: %s",
+                             ", ".join(active_sessions))
+                    active_sessions.clear()
                 join_leave = JOIN_LEAVE_RE.search(line)
                 if join_leave:
                     action, name = join_leave.group(1), join_leave.group(2).strip()
@@ -919,7 +986,15 @@ def bootstrap_active_sessions():
         log.error("Konnte Journal-Historie für Reconciliation nicht lesen: %s", e)
         return
 
+    global server_version
     for line in result.stdout.splitlines():
+        version_match = VERSION_RE.search(line)
+        if version_match:
+            server_version = version_match.group(1)
+        if SERVER_STARTED_RE.search(line):
+            active_sessions.clear()  # Sessions vor einem Neustart sind hinfällig
+            continue
+
         match = JOIN_LEAVE_RE.search(line)
         if not match:
             continue
@@ -937,6 +1012,22 @@ def bootstrap_active_sessions():
             active_sessions[name] = ts
         else:
             active_sessions.pop(name, None)
+
+    if server_version is None:
+        # Startzeile liegt außerhalb der letzten 2000 Zeilen: gezielt suchen
+        try:
+            found = subprocess.run(
+                ["journalctl", "-u", SERVICE_NAME, "-o", "cat", "--no-pager",
+                 "-g", r"INFO\] Version:"],
+                capture_output=True, text=True, timeout=30,
+            )
+            for line in found.stdout.splitlines():
+                version_match = VERSION_RE.search(line)
+                if version_match:
+                    server_version = version_match.group(1)
+        except Exception as e:
+            log.warning("Serverversion nicht ermittelbar: %s", e)
+    log.info("Erkannte Serverversion: %s", server_version or "unbekannt")
 
     if active_sessions:
         log.info("Reconciliation: aktuell online laut Log: %s", ", ".join(active_sessions))

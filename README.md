@@ -38,7 +38,7 @@ Beide Befehle erzeugen vor dem Eingriff automatisch ein Backup des aktuellen Sta
 |---|---|---|
 | Join/Leave-Meldung | Push in die Gruppe mit Spielernamen: „🟢 Name ist dem Server beigetreten“ bzw. „🔴 Name hat den Server verlassen (Session: 1h 20m)“ | `LOG_MODE` |
 | Fehler-Alarm | Meldet Zeilen mit `ERROR`, `Exception` oder `FATAL` aus dem Server-Log; unmittelbar aufeinanderfolgende gleiche Meldungen (ohne Zeitstempel verglichen) werden nur einmal gemeldet | `LOG_MODE` |
-| Ausfall-Erkennung | Meldet, wenn der Server nicht mehr antwortet und wenn er wieder online ist. Pausiert während Neustart, Update und Restore, damit es keinen Fehlalarm gibt. | `POLL_INTERVAL` |
+| Ausfall-Erkennung | Meldet, wenn der Serverdienst nicht mehr läuft (z. B. Absturz) und wenn er wieder online ist. Pausiert während Neustart, Update und Restore, damit es keinen Fehlalarm gibt. | `POLL_INTERVAL` |
 | Automatisches Backup | Sichert in festem Abstand (gerechnet ab Bot-Start) und meldet das Ergebnis in die Gruppe. Alte Backups werden aufgeräumt. | `BACKUP_INTERVAL_HOURS`, `BACKUP_RETENTION_COUNT`, `BACKUP_DIR` |
 | Geplanter Neustart | Optional: täglicher Neustart zu fester Uhrzeit mit Countdown, auf Wunsch übersprungen, wenn niemand online ist | `SCHEDULED_RESTART_*` (standardmäßig aus) |
 | Spielzeit-Statistik | Jede beendete Sitzung wird in einer lokalen SQLite-Datenbank gespeichert und speist `/playtime` und `/top` | `STATS_DB_PATH` |
@@ -90,7 +90,8 @@ Alle Einstellungen laufen über Umgebungsvariablen, siehe [`config.example.env`]
 
 ## Grenzen
 
-- Das Bedrock-Query-Protokoll liefert nur die Spieleranzahl. Namen und Join/Leave kommen aus dem Server-Log (`Player connected: <Name>, xuid: ...`); weicht das Format in künftigen Versionen ab, muss `JOIN_LEAVE_RE` in `bot.py` angepasst werden.
+- Seit Bedrock 1.26.51 nutzt der Server NetherNet und beantwortet die frühere UDP-Abfrage nicht mehr. Der Bot fragt den Server deshalb nicht ab, sondern liest den Zustand aus dem Dienststatus (systemd) und dem Server-Log: online = Dienst läuft, Spieler und Namen aus `Player connected/disconnected`, Version aus der Startzeile `Version: ...`, Spielerlimit aus `server.properties`. Weicht das Logformat in künftigen Versionen ab, müssen `JOIN_LEAVE_RE`, `VERSION_RE` und `SERVER_STARTED_RE` in `bot.py` angepasst werden.
+- Ein Server, der hängt, aber als Dienst weiterläuft, wird nicht als offline erkannt.
 - Spielerchat des Servers lässt sich ohne Behavior-Pack/Scripting nicht in Telegram spiegeln, daher gibt es keine Chat-Bridge.
 - Spielzeit-Statistik zählt erst ab Installation; läuft der Bot nicht, werden Sessions nicht erfasst.
 
