@@ -27,6 +27,10 @@ Ein Telegram-Bot, der einen Minecraft Bedrock Server überwacht und per Chat ste
 | Befehl | Was er macht |
 |---|---|
 | `/update` | Prüft bei Mojang die neueste Linux-Version. Ist sie neuer als die laufende: laden, Countdown, Server stoppen, Backup, einspielen, Server starten. Ist sie gleich, passiert nichts. |
+| `/backups` | Zeigt alle Backups mit Datum, Größe und Einordnung (Tages-Backup, Wochen-Backup, Sicherung oder „wird beim nächsten Backup gelöscht“) |
+| `/backups delete <datei>` | Löscht ein einzelnes Backup (das letzte verbleibende wird nie gelöscht) |
+| `/autorestart` | Zeigt den geplanten Neustart; `an`/`aus`, `zeit 04:00`, `countdown 90` ändern ihn, `skip` lässt den nächsten Lauf einmalig aus |
+| `/settings` | Zeigt alle Einstellungen (auch für `ALLOWED_USER_IDS`); Admins ändern sie mit `/settings <name> <wert>` und setzen sie mit `/settings reset <name>` zurück |
 | `/reinstall` | Spielt die aktuell laufende Version neu ein (z. B. um beschädigte oder veraltete Programm-/Pack-Dateien zu reparieren). Gleicher Ablauf und gleiche Sicherungen wie `/update`. |
 | `/restore` | Zeigt die vorhandenen Backups |
 | `/restore latest` | Spielt das neueste Backup ein |
@@ -42,15 +46,15 @@ Ein Telegram-Bot, der einen Minecraft Bedrock Server überwacht und per Chat ste
 | Startzusammenfassung | Nach jedem Serverstart eine Zeile mit Version und Anzahl der Fehler/Warnungen beim Start („keine Fehler oder Warnungen“ oder Verweis auf `/error`). Einzelne Meldungen beim Start werden nicht in die Gruppe geschickt. | `LOG_MODE` |
 | Fehler-Alarm | Fehler, die nach dem Start im Server-Log auftauchen, werden einzeln gemeldet; unmittelbar aufeinanderfolgende gleiche Meldungen (ohne Zeitstempel verglichen) nur einmal. Warnungen werden nur gesammelt. | `LOG_MODE`, `ERROR_ALERTS_RUNTIME` |
 | Ausfall-Erkennung | Meldet, wenn der Serverdienst nicht mehr läuft (z. B. Absturz) und wenn er wieder online ist. Pausiert während Neustart, Update und Restore, damit es keinen Fehlalarm gibt. | `POLL_INTERVAL` |
-| Automatisches Backup | Sichert in festem Abstand (gerechnet ab Bot-Start) und meldet das Ergebnis in die Gruppe. Alte Backups werden aufgeräumt. | `BACKUP_INTERVAL_HOURS`, `BACKUP_RETENTION_COUNT`, `BACKUP_DIR` |
-| Geplanter Neustart | Optional: täglicher Neustart zu fester Uhrzeit mit Countdown, auf Wunsch übersprungen, wenn niemand online ist | `SCHEDULED_RESTART_*` (standardmäßig aus) |
+| Automatisches Backup | Einmal täglich zur eingestellten Uhrzeit (Standard 03:30), Ergebnis in der Gruppe. Aufbewahrt werden die letzten 7 Tages-Backups (das neueste je Tag) plus je ein Wochen-Backup der 4 Wochen davor; Sicherungen vor Update, Neuinstallation und Restore zählen getrennt (3). Alle Zahlen und die Uhrzeit sind per `/settings` änderbar. | `/settings backup_*`, `BACKUP_*` |
+| Geplanter Neustart | Optional: täglicher Neustart zu fester Uhrzeit mit Countdown, auf Wunsch übersprungen, wenn niemand online ist. Admins verwalten ihn per `/autorestart` oder `/settings`, Änderungen gelten sofort. | `/settings neustart_*`, `SCHEDULED_RESTART_*` (standardmäßig aus) |
 | Spielzeit-Statistik | Jede beendete Sitzung wird in einer lokalen SQLite-Datenbank gespeichert und speist `/playtime` und `/top` | `STATS_DB_PATH` |
 | Wiedererkennung nach Bot-Neustart | Liest beim Start das Server-Log, damit `/spieler` auch Leute kennt, die schon vorher online waren (nur `LOG_MODE=journalctl`) | – |
 | Ingame-Ankündigungen | Countdown-Hinweise erscheinen im Spiel-Chat, wenn der Server über `run-with-fifo.sh` gestartet wird (optional) | `COMMAND_FIFO_PATH` |
 
 ### Schutzmechanismen
 
-- Zwei Berechtigungsstufen: `/restart` und `/backup` für `ALLOWED_USER_IDS`, `/update` und `/restore` nur für `ADMIN_USER_IDS`. Unberechtigte bekommen eine Absage.
+- Zwei Berechtigungsstufen: `/restart` und `/backup` für `ALLOWED_USER_IDS`; `/update`, `/reinstall`, `/restore`, `/backups`, `/autorestart` und das Ändern von Einstellungen nur für `ADMIN_USER_IDS`. Unberechtigte bekommen eine Absage.
 - Backup **vor** jedem Update und jeder Wiederherstellung, bei gestopptem Server.
 - Bricht ein Schritt ab (Backup, Entpacken, Start), bleibt der Server gestoppt und der Bot meldet den Fehler, statt mit einem halben Zustand weiterzumachen.
 - Schlägt der Download beim Update fehl, wird der Server gar nicht erst angefasst. Die ZIP wird vor dem Stoppen auf Vollständigkeit geprüft, ein abgebrochener Download hinterlässt keine halbe Datei.

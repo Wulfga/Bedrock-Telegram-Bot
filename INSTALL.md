@@ -159,10 +159,12 @@ Die drei Funktionen arbeiten auf dem **Serververzeichnis** (`SERVER_DIR`, Standa
 | | |
 |---|---|
 | Manuell | `/backup` (`ALLOWED_USER_IDS`) |
-| Automatisch | alle `BACKUP_INTERVAL_HOURS` Stunden (Standard 24), Ergebnis wird in die Gruppe gemeldet |
-| Ablage | `BACKUP_DIR` (Standard `/opt/bedrock-backups`), Dateien `backup_<Datum>_<Uhrzeit>.tar.gz` |
-| Aufbewahrung | die letzten `BACKUP_RETENTION_COUNT` Backups (Standard 7), ältere werden automatisch gelöscht |
+| Automatisch | täglich zur eingestellten Uhrzeit (Standard 03:30 in `BOT_TIMEZONE`), Ergebnis wird in die Gruppe gemeldet |
+| Ablage | `BACKUP_DIR` (Standard `/opt/bedrock-backups`), Dateien `backup_<Datum>_<Uhrzeit>.tar.gz`; Sicherungen vor einem Eingriff tragen den Zusatz `_pre-update`, `_pre-reinstall` oder `_pre-restore` |
+| Aufbewahrung | das neueste Backup je Tag für die letzten 7 Tage, dazu je Woche das neueste für die 4 Wochen davor, und getrennt davon die letzten 3 Sicherungen vor Update/Neuinstallation/Restore. Alles Übrige löscht der Bot nach dem nächsten Backup. Dateien, die nicht dem Namensschema entsprechen, rührt er nie an. |
 | Inhalt | das komplette Serververzeichnis (Welten, Konfiguration, Server-Dateien) |
+
+**Verwalten im Chat (nur `ADMIN_USER_IDS`):** `/backups` zeigt alle Backups und wie sie eingeordnet sind, `/backups delete <datei>` löscht eines. Uhrzeit und Anzahlen ändert man mit `/settings`, z. B. `/settings backup_zeit 04:00`, `/settings backup_tage 10`, `/settings backup_wochen 6`, `/settings backup_aktiv aus`. Die Werte in der `.env` (`BACKUP_TIME`, `BACKUP_DAILY_KEEP`, `BACKUP_WEEKLY_KEEP`, `BACKUP_SAFETY_KEEP`) sind nur die Standards.
 
 Hinweis: `/backup` und das automatische Backup laufen **bei laufendem Server**. Eine Welt, in die gerade geschrieben wird, kann dabei inkonsistent gesichert werden. Die Backups vor `/update` und `/restore` werden dagegen immer bei gestopptem Server erstellt. `BACKUP_DIR` darf nicht innerhalb von `SERVER_DIR` liegen.
 
@@ -174,7 +176,7 @@ Ablauf:
 
 1. Fragt bei Mojang die aktuelle Linux-Version ab und vergleicht sie mit der laufenden. Ist sie gleich, passiert nichts ("Bereits aktuell").
 2. Lädt die neue ZIP nach `UPDATE_DIR` (Standard `/opt/bedrock-updates`). Schlägt das fehl, bleibt der Server unberührt.
-3. Sind Spieler online, gibt es einen Countdown (`RESTART_COUNTDOWN_SECONDS`, Standard 60 s) mit Hinweisen im Spiel-Chat, falls die FIFO aus Abschnitt 4 eingerichtet ist.
+3. Sind Spieler online, gibt es einen Countdown (Einstellung `countdown`, Standard 60 s) mit Hinweisen im Spiel-Chat, falls die FIFO aus Abschnitt 4 eingerichtet ist.
 4. Stoppt den Server, erstellt ein Backup, entpackt das Update und startet den Server.
 
 **Diese Pfade werden dabei nie überschrieben** (`UPDATE_PROTECTED_PATHS`):
@@ -209,14 +211,15 @@ Dateien, die nicht in der ZIP stehen (z. B. eigene Packs), werden weder übersch
 
 Ablauf: Countdown (falls Spieler online sind), Server stoppen, **Sicherheitsbackup des aktuellen Stands**, Backup über das Serververzeichnis entpacken, Server starten.
 
-`/restore` überschreibt Welten **und** Konfigurationsdateien mit dem Stand aus dem Backup. Dateien, die es jetzt gibt, im Backup aber nicht, werden nicht gelöscht. Es gibt keine Rückfrage: `ADMIN_USER_IDS` nur an vertrauenswürdige Personen vergeben. Das Sicherheitsbackup zählt zur Aufbewahrungsgrenze, bei vielen Wiederherstellungen hintereinander werden also ältere Backups entsprechend früher gelöscht.
+`/restore` überschreibt Welten **und** Konfigurationsdateien mit dem Stand aus dem Backup. Dateien, die es jetzt gibt, im Backup aber nicht, werden nicht gelöscht. Es gibt keine Rückfrage: `ADMIN_USER_IDS` nur an vertrauenswürdige Personen vergeben. Das Sicherheitsbackup wird getrennt gezählt (`backup_sicherheit`, Standard 3) und verdrängt deshalb keine Tages- oder Wochen-Backups.
 
 ### Berechtigungen im Überblick
 
 | Befehl | Wer |
 |---|---|
 | `/restart`, `/backup` | `ALLOWED_USER_IDS` |
-| `/update`, `/restore` | `ADMIN_USER_IDS` (leer = wie `ALLOWED_USER_IDS`) |
+| `/backups`, `/autorestart`, Einstellungen ändern | `ADMIN_USER_IDS` (`/settings` ansehen dürfen auch `ALLOWED_USER_IDS`) |
+| `/update`, `/reinstall`, `/restore` | `ADMIN_USER_IDS` (leer = wie `ALLOWED_USER_IDS`) |
 
 ---
 

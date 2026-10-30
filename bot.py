@@ -7,6 +7,8 @@ Befehle:
   /spieler   - Wer ist aktuell online
   /restart   - Neustart mit Countdown-Ankündigung im Spiel (nur ALLOWED_USER_IDS)
   /backup    - Manuelles Backup der Weltdaten (nur ALLOWED_USER_IDS)
+  /backups   - Backups ansehen/löschen (nur ADMIN_USER_IDS)
+  /autorestart - Geplanten Neustart verwalten (nur ADMIN_USER_IDS)
   /update    - Prüft automatisch auf neue Version, lädt sie herunter und
                installiert sie: Stop, Backup, Update, Start - worlds/Configs
                bleiben erhalten (nur ADMIN_USER_IDS)
@@ -16,6 +18,7 @@ Befehle:
                (nur ADMIN_USER_IDS)
   /playtime  - Spielzeit eines Spielers anzeigen: /playtime <Name>
   /top       - Top-5-Rangliste nach Spielzeit
+  /settings  - Einstellungen anzeigen/ändern (Ändern nur ADMIN_USER_IDS)
   /error     - Fehler/Warnungen aus dem Server-Log seit dem letzten Start
   /help      - Hilfe
 
@@ -23,8 +26,9 @@ Hintergrund-Tasks:
   - Offline/Online-Erkennung des Servers
   - Live-Log-Watcher: Join/Leave (mit Klarnamen + Spielzeit-Tracking) und
     Sammeln von Fehlern/Warnungen (Zusammenfassung beim Serverstart)
-  - Automatisches, zeitgesteuertes Backup (BACKUP_INTERVAL_HOURS)
-  - Geplanter täglicher Neustart (SCHEDULED_RESTART_ENABLED)
+  - Automatisches Backup zu fester Uhrzeit mit Tages-/Wochen-Aufbewahrung
+  - Geplanter täglicher Neustart
+  (Zeiten und Anzahlen sind per /settings änderbar)
 
 Konfiguration erfolgt über Umgebungsvariablen (siehe config.example.env).
 """
@@ -43,7 +47,8 @@ import tempfile
 import time
 import urllib.request
 import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -74,10 +79,8 @@ ADMIN_USER_IDS = {
     for uid in os.environ.get("ADMIN_USER_IDS", "").split(",")
     if uid.strip()
 } or set(ALLOWED_USER_IDS)
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "30"))
 
 COMMAND_FIFO_PATH = os.environ.get("COMMAND_FIFO_PATH", "/opt/bedrock/command_input")
-RESTART_COUNTDOWN_SECONDS = int(os.environ.get("RESTART_COUNTDOWN_SECONDS", "60"))
 RESTART_ANNOUNCE_THRESHOLDS = [30, 10, 5, 4, 3, 2, 1]
 
 LOG_MODE = os.environ.get("LOG_MODE", "journalctl")
@@ -85,8 +88,6 @@ LOG_FILE_PATH = os.environ.get("LOG_FILE_PATH", "")
 
 # Backups
 BACKUP_DIR = os.environ.get("BACKUP_DIR", "/opt/bedrock-backups")
-BACKUP_INTERVAL_HOURS = float(os.environ.get("BACKUP_INTERVAL_HOURS", "24"))
-BACKUP_RETENTION_COUNT = int(os.environ.get("BACKUP_RETENTION_COUNT", "7"))
 
 # Statistik-Datenbank (Spielzeiten)
 # Standard: stats.db im selben Ordner wie bot.py (unabhängig vom Installationspfad)
@@ -118,20 +119,6 @@ UPDATE_PROTECTED_PATHS = [
 BEDROCK_DOWNLOAD_API = "https://net-secondary.web.minecraft-services.net/api/v1.0/download/links"
 BEDROCK_DOWNLOAD_USER_AGENT = (
     "Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1; BEDROCK-UPDATER)"
-)
-
-# Geplante Neustarts
-# Fehler, die NACH dem Serverstart im Log auftauchen, einzeln in die Gruppe melden.
-# Fehler/Warnungen während des Starts werden nie einzeln gemeldet (siehe /error).
-ERROR_ALERTS_RUNTIME = os.environ.get("ERROR_ALERTS_RUNTIME", "true").lower() in ("1", "true", "yes")
-SCHEDULED_RESTART_ENABLED = os.environ.get("SCHEDULED_RESTART_ENABLED", "false").lower() == "true"
-SCHEDULED_RESTART_HOUR = int(os.environ.get("SCHEDULED_RESTART_HOUR", "4"))
-SCHEDULED_RESTART_MINUTE = int(os.environ.get("SCHEDULED_RESTART_MINUTE", "0"))
-SCHEDULED_RESTART_COUNTDOWN_SECONDS = int(
-    os.environ.get("SCHEDULED_RESTART_COUNTDOWN_SECONDS", str(RESTART_COUNTDOWN_SECONDS))
-)
-SCHEDULED_RESTART_SKIP_IF_EMPTY = (
-    os.environ.get("SCHEDULED_RESTART_SKIP_IF_EMPTY", "true").lower() == "true"
 )
 
 logging.basicConfig(
@@ -177,6 +164,9 @@ def init_db():
             leave_time REAL NOT NULL
         )
         """
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     )
     conn.commit()
     conn.close()
@@ -435,30 +425,352 @@ async def perform_restart_sequence(seconds: int, notify):
     await do_restart_service(notify)
 
 
-# --- Backup-Logik ------------------------------------------------------------
-def _do_backup() -> tuple[str, int]:
-    """Erstellt ein tar.gz-Backup von SERVER_DIR. Gibt (pfad, größe_bytes) zurück."""
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    archive_path_base = os.path.join(BACKUP_DIR, f"backup_{timestamp}")
-    archive_path = shutil.make_archive(archive_path_base, "gztar", SERVER_DIR)
-    size = os.path.getsize(archive_path)
+# --- Einstellungen zur Laufzeit (/settings) ---------------------------------
+# Admins ändern diese Werte im Chat; sie werden in der Datenbank gespeichert und
+# überstehen Neustarts. Ohne gespeicherten Wert gilt der Standard, der aus der
+# .env kommt (siehe config.example.env). Pfade, Token und Benutzer-IDs gehören
+# bewusst NICHT hierher, die bleiben in der .env.
+def _parse_bool(raw) -> bool:
+    value = str(raw).strip().lower()
+    if value in ("an", "ein", "ja", "on", "true", "1", "yes"):
+        return True
+    if value in ("aus", "nein", "off", "false", "0", "no"):
+        return False
+    raise ValueError("bitte 'an' oder 'aus' angeben")
 
-    # Alte Backups aufräumen, nur die letzten BACKUP_RETENTION_COUNT behalten
-    backups = sorted(glob.glob(os.path.join(BACKUP_DIR, "backup_*.tar.gz")))
-    while len(backups) > BACKUP_RETENTION_COUNT:
-        oldest = backups.pop(0)
+
+def _parse_time(raw) -> str:
+    match = re.fullmatch(r"\s*(\d{1,2})[:.](\d{2})\s*", str(raw))
+    if not match or int(match.group(1)) > 23 or int(match.group(2)) > 59:
+        raise ValueError("bitte als HH:MM angeben, z. B. 03:30")
+    return f"{int(match.group(1)):02d}:{match.group(2)}"
+
+
+def _int_parser(low: int, high: int):
+    def parse(raw) -> int:
         try:
-            os.remove(oldest)
-            log.info("Altes Backup gelöscht: %s", oldest)
+            number = int(str(raw).strip())
+        except ValueError:
+            raise ValueError("bitte eine ganze Zahl angeben")
+        if not low <= number <= high:
+            raise ValueError(f"erlaubt sind {low} bis {high}")
+        return number
+    return parse
+
+
+def _parse_timezone(raw) -> str:
+    name = str(raw).strip()
+    try:
+        ZoneInfo(name)
+    except Exception:
+        raise ValueError("unbekannte Zeitzone, z. B. Europe/Berlin")
+    return name
+
+
+def _env(name: str, default: str) -> str:
+    return os.environ.get(name, default)
+
+
+_LEGACY_RESTART_TIME = "{:02d}:{:02d}".format(
+    int(_env("SCHEDULED_RESTART_HOUR", "4")), int(_env("SCHEDULED_RESTART_MINUTE", "0"))
+)
+
+# Schlüssel -> Beschreibung. "default" kommt aus der .env (bzw. fest), "parse"
+# prüft Eingaben aus dem Chat und liefert den typisierten Wert.
+SETTINGS: dict[str, dict] = {
+    "backup_aktiv": dict(
+        group="Backup", parse=_parse_bool,
+        default=_parse_bool(_env("BACKUP_ENABLED", "an")),
+        desc="Automatisches Backup an/aus",
+    ),
+    "backup_zeit": dict(
+        group="Backup", parse=_parse_time,
+        default=_parse_time(_env("BACKUP_TIME", "03:30")),
+        desc="Uhrzeit des täglichen Backups (HH:MM)",
+    ),
+    "backup_tage": dict(
+        group="Backup", parse=_int_parser(1, 60),
+        default=_int_parser(1, 60)(_env("BACKUP_DAILY_KEEP", _env("BACKUP_RETENTION_COUNT", "7"))),
+        desc="Tages-Backups, die aufbewahrt werden (das neueste je Tag)",
+    ),
+    "backup_wochen": dict(
+        group="Backup", parse=_int_parser(0, 52),
+        default=_int_parser(0, 52)(_env("BACKUP_WEEKLY_KEEP", "4")),
+        desc="Zusätzliche Wochen-Backups (je Woche das neueste, älter als die Tages-Backups)",
+    ),
+    "backup_sicherheit": dict(
+        group="Backup", parse=_int_parser(1, 30),
+        default=_int_parser(1, 30)(_env("BACKUP_SAFETY_KEEP", "3")),
+        desc="Sicherungen vor Update/Neuinstallation/Restore, die aufbewahrt werden",
+    ),
+    "neustart_aktiv": dict(
+        group="Geplanter Neustart", parse=_parse_bool,
+        default=_parse_bool(_env("SCHEDULED_RESTART_ENABLED", "aus")),
+        desc="Täglicher Neustart an/aus",
+    ),
+    "neustart_zeit": dict(
+        group="Geplanter Neustart", parse=_parse_time,
+        default=_parse_time(_env("SCHEDULED_RESTART_TIME", _LEGACY_RESTART_TIME)),
+        desc="Uhrzeit des täglichen Neustarts (HH:MM)",
+    ),
+    "neustart_countdown": dict(
+        group="Geplanter Neustart", parse=_int_parser(0, 600),
+        default=_int_parser(0, 600)(_env(
+            "SCHEDULED_RESTART_COUNTDOWN_SECONDS", _env("RESTART_COUNTDOWN_SECONDS", "60"))),
+        desc="Countdown vor dem geplanten Neustart in Sekunden",
+    ),
+    "neustart_ueberspringen": dict(
+        group="Geplanter Neustart", parse=_parse_bool,
+        default=_parse_bool(_env("SCHEDULED_RESTART_SKIP_IF_EMPTY", "an")),
+        desc="Geplanten Neustart überspringen, wenn niemand online ist",
+    ),
+    "countdown": dict(
+        group="Allgemein", parse=_int_parser(0, 600),
+        default=_int_parser(0, 600)(_env("RESTART_COUNTDOWN_SECONDS", "60")),
+        desc="Standard-Countdown für /restart, /update, /reinstall, /restore in Sekunden",
+    ),
+    "fehler_alarm": dict(
+        group="Allgemein", parse=_parse_bool,
+        default=_parse_bool(_env("ERROR_ALERTS_RUNTIME", "an")),
+        desc="Fehler im laufenden Betrieb einzeln melden (Start-Fehler nie, siehe /error)",
+    ),
+    "pruef_intervall": dict(
+        group="Allgemein", parse=_int_parser(10, 600),
+        default=_int_parser(10, 600)(_env("POLL_INTERVAL", "30")),
+        desc="Wie oft der Serverstatus geprüft wird, in Sekunden",
+    ),
+    "zeitzone": dict(
+        group="Allgemein", parse=_parse_timezone,
+        # Bewusst nicht geprüft: fehlen die Zeitzonen-Daten, soll der Bot trotzdem starten
+        # (now_local() fällt dann auf die Systemzeit zurück)
+        default=_env("BOT_TIMEZONE", "Europe/Berlin").strip(),
+        desc="Zeitzone für Backup- und Neustartzeiten",
+    ),
+}
+
+_setting_overrides: dict[str, object] = {}
+# Je ein Event pro Hintergrund-Task, damit Änderungen sofort greifen
+settings_events: dict[str, asyncio.Event] = {"backup": asyncio.Event(), "restart": asyncio.Event()}
+
+
+def cfg(key: str):
+    """Aktueller Wert einer Einstellung (gespeicherter Wert oder Standard)."""
+    return _setting_overrides.get(key, SETTINGS[key]["default"])
+
+
+def format_setting_value(key: str, value) -> str:
+    return ("an" if value else "aus") if isinstance(value, bool) else str(value)
+
+
+def _db_save_setting(key: str, value: str | None):
+    conn = sqlite3.connect(STATS_DB_PATH)
+    if value is None:
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+    else:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
+
+
+def load_settings():
+    """Liest gespeicherte Einstellungen beim Start. Ungültige Werte werden ignoriert."""
+    conn = sqlite3.connect(STATS_DB_PATH)
+    rows = conn.execute("SELECT key, value FROM settings").fetchall()
+    conn.close()
+    for key, raw in rows:
+        if key not in SETTINGS:
+            continue
+        try:
+            _setting_overrides[key] = SETTINGS[key]["parse"](raw)
+        except ValueError as e:
+            log.warning("Gespeicherte Einstellung %s=%r ungültig (%s) - nutze Standard", key, raw, e)
+
+
+def wake_schedulers():
+    for event in settings_events.values():
+        event.set()
+
+
+def set_setting(key: str, raw: str) -> tuple[object, object]:
+    """Setzt und speichert eine Einstellung. Wirft ValueError bei ungültiger Eingabe.
+    Gibt (alter_wert, neuer_wert) zurück."""
+    value = SETTINGS[key]["parse"](raw)
+    old = cfg(key)
+    _db_save_setting(key, format_setting_value(key, value))
+    _setting_overrides[key] = value
+    wake_schedulers()
+    return old, value
+
+
+def reset_setting(key: str) -> tuple[object, object]:
+    old = cfg(key)
+    _db_save_setting(key, None)
+    _setting_overrides.pop(key, None)
+    wake_schedulers()
+    return old, cfg(key)
+
+
+_tz_warned = False
+
+
+def now_local() -> datetime:
+    """Aktuelle Zeit in der eingestellten Zeitzone (Fallback: Systemzeit)."""
+    global _tz_warned
+    try:
+        return datetime.now(ZoneInfo(cfg("zeitzone")))
+    except Exception as e:
+        if not _tz_warned:
+            _tz_warned = True
+            log.warning("Zeitzone %s nicht nutzbar (%s) - nutze Systemzeit. "
+                        "Abhilfe: 'apt install tzdata' oder 'pip install tzdata' im venv.",
+                        cfg("zeitzone"), e)
+        return datetime.now().astimezone()
+
+
+def next_occurrence(hhmm: str) -> datetime:
+    """Nächster Zeitpunkt, an dem die Uhr HH:MM zeigt (heute oder morgen)."""
+    now = now_local()
+    hour, minute = (int(part) for part in hhmm.split(":"))
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target = (now + timedelta(days=1)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return target
+
+
+def seconds_until(target: datetime) -> float:
+    # Über UTC rechnen, damit Sommerzeit-Wechsel nicht um eine Stunde verfälschen
+    return max(0.0, (target.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds())
+
+
+async def wait_or_change(name: str, seconds: float) -> bool:
+    """Wartet bis zu `seconds`. Gibt True zurück, wenn zwischendurch eine
+    Einstellung geändert wurde (Zeitpunkt dann neu berechnen), sonst False."""
+    event = settings_events[name]
+    try:
+        await asyncio.wait_for(event.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        return False
+    event.clear()
+    return True
+
+
+WEEKDAYS = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+
+
+def format_when(moment: datetime) -> str:
+    return f"{WEEKDAYS[moment.weekday()]} {moment:%d.%m. %H:%M}"
+
+
+# --- Backup-Logik ------------------------------------------------------------
+# Dateinamen: backup_<Datum>_<Uhrzeit>.tar.gz (automatisch/manuell) und
+# backup_<Datum>_<Uhrzeit>_pre-update|pre-reinstall|pre-restore.tar.gz (Sicherungen
+# vor einem Eingriff). Beide Arten werden getrennt aufbewahrt.
+BACKUP_NAME_RE = re.compile(
+    r"^backup_(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})(?:_(pre-[a-z]+))?\.tar\.gz$"
+)
+last_retention_summary = ""
+skip_next_restart = False  # /autorestart skip: nächsten Lauf einmalig auslassen
+
+
+def parse_backup_name(path: str):
+    """(Zeitpunkt, Art) oder None, wenn der Name nicht zum Schema passt.
+    Art ist None für normale Backups, sonst z.B. 'pre-update'."""
+    match = BACKUP_NAME_RE.match(os.path.basename(path))
+    if not match:
+        return None
+    return datetime.strptime(match.group(1), "%Y-%m-%d_%H-%M-%S"), match.group(2)
+
+
+def classify_backups(items, daily: int, weekly: int, safety: int) -> dict[str, str]:
+    """items: Liste von (pfad, zeitpunkt, art). Gibt {pfad: rolle} für alle Backups
+    zurück, die aufbewahrt werden. Rollen: 'tag', 'woche', 'sicherung'.
+
+    Normale Backups:
+      - je eines der `daily` jüngsten Tage mit Backups (das neueste des Tages)
+      - zusätzlich je eines der `weekly` jüngsten Kalenderwochen unter den übrigen
+        (älter als die Tages-Backups), jeweils das neueste der Woche
+    Sicherungen (art beginnt mit 'pre-'): die `safety` neuesten."""
+    roles: dict[str, str] = {}
+
+    regular = sorted((i for i in items if i[2] is None), key=lambda i: i[1], reverse=True)
+    newest_per_day: dict = {}
+    for path, moment, _ in regular:
+        newest_per_day.setdefault(moment.date(), path)
+    daily_days = sorted(newest_per_day, reverse=True)[:daily]
+    for day in daily_days:
+        roles[newest_per_day[day]] = "tag"
+
+    newest_per_week: dict = {}
+    for path, moment, _ in regular:
+        if moment.date() in daily_days:
+            continue
+        iso = moment.isocalendar()
+        newest_per_week.setdefault((iso[0], iso[1]), path)
+    for week in sorted(newest_per_week, reverse=True)[:weekly]:
+        roles[newest_per_week[week]] = "woche"
+
+    safeties = sorted((i for i in items if i[2] is not None), key=lambda i: i[1], reverse=True)
+    for path, _, _ in safeties[:safety]:
+        roles[path] = "sicherung"
+    return roles
+
+
+def select_backups_to_keep(items, daily: int, weekly: int, safety: int) -> set[str]:
+    return set(classify_backups(items, daily, weekly, safety))
+
+
+def read_backup_items() -> list[tuple[str, datetime, str | None]]:
+    items = []
+    for path in glob.glob(os.path.join(BACKUP_DIR, "backup_*.tar.gz")):
+        parsed = parse_backup_name(path)
+        if parsed:
+            items.append((path, parsed[0], parsed[1]))
+    return items
+
+
+def apply_backup_retention() -> list[str]:
+    """Löscht Backups, die nach den Einstellungen nicht mehr aufbewahrt werden.
+    Dateien mit unbekanntem Namen werden nie angefasst. Gibt die gelöschten Namen zurück."""
+    global last_retention_summary
+    items = read_backup_items()
+
+    keep = select_backups_to_keep(
+        items, cfg("backup_tage"), cfg("backup_wochen"), cfg("backup_sicherheit")
+    )
+    removed = []
+    for path, _, _ in items:
+        if path in keep:
+            continue
+        try:
+            os.remove(path)
+            removed.append(os.path.basename(path))
+            log.info("Altes Backup gelöscht: %s", path)
         except OSError as e:
             log.error("Konnte altes Backup nicht löschen: %s", e)
 
+    regular_kept = sum(1 for path, _, kind in items if path in keep and kind is None)
+    safety_kept = sum(1 for path, _, kind in items if path in keep and kind is not None)
+    last_retention_summary = (
+        f"Aufbewahrt: {regular_kept} Backups, {safety_kept} Sicherungen"
+        + (f"; {len(removed)} alte gelöscht" if removed else "")
+    )
+    return removed
+
+
+def _do_backup(kind: str = "") -> tuple[str, int]:
+    """Erstellt ein tar.gz-Backup von SERVER_DIR. kind ist leer oder z.B.
+    'pre-update'. Gibt (pfad, größe_bytes) zurück."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    timestamp = now_local().strftime("%Y-%m-%d_%H-%M-%S")
+    archive_path_base = os.path.join(BACKUP_DIR, f"backup_{timestamp}" + (f"_{kind}" if kind else ""))
+    archive_path = shutil.make_archive(archive_path_base, "gztar", SERVER_DIR)
+    size = os.path.getsize(archive_path)
+    apply_backup_retention()
     return archive_path, size
 
 
-async def run_backup() -> tuple[str, int]:
-    return await asyncio.get_event_loop().run_in_executor(None, _do_backup)
+async def run_backup(kind: str = "") -> tuple[str, int]:
+    return await asyncio.get_event_loop().run_in_executor(None, _do_backup, kind)
 
 
 # --- Automatischer Download der neuesten Version -----------------------
@@ -660,7 +972,7 @@ async def perform_update_sequence(zip_path: str, seconds: int, notify, reinstall
 
     await notify(f"💾 Erstelle Backup {before} ...")
     try:
-        backup_path, backup_size = await run_backup()
+        backup_path, backup_size = await run_backup("pre-reinstall" if reinstall else "pre-update")
         await verify_backup_has_worlds(backup_path)
         await notify(
             f"✅ Backup fertig und geprüft: `{os.path.basename(backup_path)}` "
@@ -731,7 +1043,7 @@ async def perform_restore_sequence(backup_path: str, seconds: int, notify):
 
     await notify("💾 Sichere aktuellen Stand vor der Wiederherstellung (Sicherheitsnetz) ...")
     try:
-        safety_path, safety_size = await run_backup()
+        safety_path, safety_size = await run_backup("pre-restore")
         await notify(
             f"✅ Sicherheitsbackup: `{os.path.basename(safety_path)}` "
             f"({safety_size / (1024*1024):.1f} MB)"
@@ -843,6 +1155,205 @@ async def cmd_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(out)  # bewusst ohne Markdown (Unterstriche in IDs)
 
 
+# --- /settings, /backups, /autorestart (Verwaltung) ---------------------------
+def settings_overview_text() -> str:
+    lines = [f"⚙️ Einstellungen (Zeitzone: {cfg('zeitzone')})"]
+    group = None
+    for key, spec in SETTINGS.items():
+        if spec["group"] != group:
+            group = spec["group"]
+            lines.append(f"\n{group}")
+        value = format_setting_value(key, cfg(key))
+        changed = " (geändert)" if key in _setting_overrides else ""
+        lines.append(f"• {key} = {value}{changed}\n   {spec['desc']}")
+    lines.append(
+        "\nÄndern: /settings <name> <wert>, z. B. /settings backup_zeit 04:00\n"
+        "Zurücksetzen: /settings reset <name>\n"
+        "Backups verwalten: /backups, Neustart verwalten: /autorestart"
+    )
+    return "\n".join(lines)
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    is_admin = user_id in ADMIN_USER_IDS
+    if not is_admin and user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("⛔ Du bist nicht berechtigt, die Einstellungen zu sehen.")
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(settings_overview_text())
+        return
+    if not is_admin:
+        await update.message.reply_text("⛔ Nur Admins dürfen Einstellungen ändern.")
+        return
+
+    if args[0].lower() == "reset":
+        key = args[1].lower() if len(args) > 1 else ""
+        if key not in SETTINGS:
+            await update.message.reply_text("Nutzung: /settings reset <name>  (Namen siehe /settings)")
+            return
+        old, new = reset_setting(key)
+        await update.message.reply_text(
+            f"↩️ {key}: {format_setting_value(key, old)} → {format_setting_value(key, new)} (Standard)"
+        )
+        log.info("Einstellung %s zurückgesetzt von user_id=%s", key, user_id)
+        return
+
+    key = args[0].lower()
+    if key not in SETTINGS:
+        await update.message.reply_text(f"❌ Unbekannte Einstellung '{args[0]}'. Alle Namen: /settings")
+        return
+    if len(args) == 1:
+        await update.message.reply_text(
+            f"{key} = {format_setting_value(key, cfg(key))}\n{SETTINGS[key]['desc']}\n"
+            f"Ändern: /settings {key} <wert>"
+        )
+        return
+
+    try:
+        old, new = set_setting(key, " ".join(args[1:]))
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {key}: {e}")
+        return
+    log.info("Einstellung %s: %r -> %r (user_id=%s)", key, old, new, user_id)
+
+    text = f"✅ {key}: {format_setting_value(key, old)} → {format_setting_value(key, new)}"
+    if key in ("backup_zeit", "backup_aktiv", "zeitzone") and cfg("backup_aktiv"):
+        text += f"\nNächstes Backup: {format_when(next_occurrence(cfg('backup_zeit')))}"
+    if key in ("neustart_zeit", "neustart_aktiv", "zeitzone") and cfg("neustart_aktiv"):
+        text += f"\nNächster geplanter Neustart: {format_when(next_occurrence(cfg('neustart_zeit')))}"
+    if key in ("backup_tage", "backup_wochen", "backup_sicherheit"):
+        text += "\nGilt ab dem nächsten Backup; vorhandene Backups werden erst dann aufgeräumt."
+    await update.message.reply_text(text)
+
+
+ROLE_LABELS = {"tag": "Tages-Backup", "woche": "Wochen-Backup", "sicherung": "Sicherung"}
+
+
+async def cmd_backups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/backups - Liste mit Einordnung; /backups delete <datei> - ein Backup löschen."""
+    if update.effective_user.id not in ADMIN_USER_IDS:
+        await update.message.reply_text("⛔ Nur Admins dürfen Backups verwalten.")
+        return
+
+    args = context.args or []
+    items = read_backup_items()
+
+    if args and args[0].lower() in ("delete", "loeschen", "löschen"):
+        name = args[1] if len(args) > 1 else ""
+        path = os.path.join(BACKUP_DIR, os.path.basename(name))
+        if not name or os.path.basename(name) != name or not parse_backup_name(name) or not os.path.isfile(path):
+            await update.message.reply_text(
+                "Nutzung: /backups delete <dateiname>  (Namen siehe /backups)"
+            )
+            return
+        if len(items) <= 1:
+            await update.message.reply_text("❌ Das ist das einzige Backup - ich lösche es nicht.")
+            return
+        try:
+            os.remove(path)
+        except OSError as e:
+            await update.message.reply_text(f"❌ Konnte nicht löschen: {e}")
+            return
+        log.info("Backup %s gelöscht von user_id=%s", name, update.effective_user.id)
+        await update.message.reply_text(f"🗑 Gelöscht: `{name}`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if not items:
+        await update.message.reply_text(f"Keine Backups in {BACKUP_DIR} gefunden.")
+        return
+
+    roles = classify_backups(items, cfg("backup_tage"), cfg("backup_wochen"), cfg("backup_sicherheit"))
+    items.sort(key=lambda i: i[1], reverse=True)
+    total_bytes = 0
+    lines = []
+    for path, moment, kind in items:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        total_bytes += size
+        if path in roles:
+            role = ROLE_LABELS[roles[path]] + (f" ({kind})" if kind else "")
+        else:
+            role = "wird beim nächsten Backup gelöscht"
+        if len(lines) < 30:
+            lines.append(
+                f"• `{os.path.basename(path)}`\n   {format_when(moment)} · {size / (1024*1024):.0f} MB · {role}"
+            )
+    header = (
+        f"💾 {len(items)} Backups, zusammen {total_bytes / (1024**3):.1f} GB\n"
+        f"Aufbewahrung: {cfg('backup_tage')} Tage, {cfg('backup_wochen')} Wochen, "
+        f"{cfg('backup_sicherheit')} Sicherungen\n"
+    )
+    if cfg("backup_aktiv"):
+        header += f"Nächstes Backup: {format_when(next_occurrence(cfg('backup_zeit')))}\n"
+    else:
+        header += "Automatisches Backup: aus\n"
+    footer = "\n\nLöschen: /backups delete <dateiname>\nEinstellungen: /settings"
+    if len(items) > len(lines):
+        footer = f"\n... und {len(items) - len(lines)} weitere" + footer
+    await update.message.reply_text(
+        header + "\n" + "\n".join(lines) + footer, parse_mode=ParseMode.MARKDOWN
+    )
+
+
+def autorestart_status_text() -> str:
+    if cfg("neustart_aktiv"):
+        text = (
+            f"🕓 Geplanter Neustart: an, täglich um {cfg('neustart_zeit')} ({cfg('zeitzone')})\n"
+            f"Nächster: {format_when(next_occurrence(cfg('neustart_zeit')))}"
+            + (" - wird einmalig übersprungen" if skip_next_restart else "")
+        )
+    else:
+        text = "🕓 Geplanter Neustart: aus"
+    text += (
+        f"\nCountdown: {cfg('neustart_countdown')} s · überspringen, wenn niemand online: "
+        f"{format_setting_value('', cfg('neustart_ueberspringen'))}"
+    )
+    text += (
+        "\n\n/autorestart an | aus\n/autorestart zeit 04:00\n/autorestart countdown 60\n"
+        "/autorestart skip  (nächsten Lauf einmalig auslassen, nochmal = zurücknehmen)"
+    )
+    return text
+
+
+async def cmd_autorestart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global skip_next_restart
+    if update.effective_user.id not in ADMIN_USER_IDS:
+        await update.message.reply_text("⛔ Nur Admins dürfen den geplanten Neustart verwalten.")
+        return
+
+    args = [a.lower() for a in (context.args or [])]
+    if not args:
+        await update.message.reply_text(autorestart_status_text())
+        return
+
+    command = args[0]
+    try:
+        if command in ("an", "aus", "on", "off"):
+            set_setting("neustart_aktiv", command)
+        elif command == "zeit" and len(args) > 1:
+            set_setting("neustart_zeit", args[1])
+        elif command == "countdown" and len(args) > 1:
+            set_setting("neustart_countdown", args[1])
+        elif command in ("skip", "ueberspringen", "überspringen"):
+            if not cfg("neustart_aktiv"):
+                await update.message.reply_text("Der geplante Neustart ist aus - es gibt nichts zu überspringen.")
+                return
+            skip_next_restart = not skip_next_restart
+        else:
+            await update.message.reply_text(autorestart_status_text())
+            return
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {e}")
+        return
+    log.info("/autorestart %s von user_id=%s", " ".join(args), update.effective_user.id)
+    await update.message.reply_text("✅ Gespeichert.\n\n" + autorestart_status_text())
+
+
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USER_IDS:
@@ -850,13 +1361,13 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning("Unautorisierter Restart-Versuch von user_id=%s", user_id)
         return
 
-    seconds = RESTART_COUNTDOWN_SECONDS
+    seconds = cfg("countdown")
     if context.args:
         try:
             seconds = max(0, int(context.args[0]))
         except ValueError:
             await update.message.reply_text(
-                f"Ungültige Angabe, nutze Standard-Countdown ({RESTART_COUNTDOWN_SECONDS}s)."
+                f"Ungültige Angabe, nutze Standard-Countdown ({cfg('countdown')}s)."
             )
 
     async def notify(text: str):
@@ -924,7 +1435,7 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def notify(text: str):
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-    await perform_update_sequence(zip_path, RESTART_COUNTDOWN_SECONDS, notify)
+    await perform_update_sequence(zip_path, cfg("countdown"), notify)
 
 
 async def cmd_reinstall(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -976,7 +1487,7 @@ async def cmd_reinstall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def notify(text: str):
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-    await perform_update_sequence(zip_path, RESTART_COUNTDOWN_SECONDS, notify, reinstall=True)
+    await perform_update_sequence(zip_path, cfg("countdown"), notify, reinstall=True)
 
 
 async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1017,7 +1528,7 @@ async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def notify(text: str):
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-    await perform_restore_sequence(backup_path, RESTART_COUNTDOWN_SECONDS, notify)
+    await perform_restore_sequence(backup_path, cfg("countdown"), notify)
 
 
 async def cmd_playtime(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1069,6 +1580,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/error [warn] [anzahl] - Fehler (oder Warnungen) aus dem Server-Log seit dem letzten Start\n"
         "/restart [sekunden] - Neustart mit Countdown (nur berechtigte Nutzer)\n"
         "/backup - Manuelles Backup erstellen (nur berechtigte Nutzer)\n"
+        "/backups - Backups ansehen und löschen (nur Admins)\n"
+        "/autorestart - Geplanten Neustart verwalten (nur Admins)\n"
+        "/settings - Einstellungen ansehen; ändern nur Admins\n"
         "/update - Prüft automatisch auf die neueste Version, lädt sie herunter "
         "und installiert sie: Stop, Backup, Entpacken "
         "(worlds/Configs bleiben erhalten), Start (nur Admins)\n"
@@ -1078,10 +1592,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/playtime <Name> - Spielzeit eines Spielers\n"
         "/top - Top-5-Rangliste nach Spielzeit\n"
     )
-    if SCHEDULED_RESTART_ENABLED:
+    if cfg("neustart_aktiv"):
         text += (
             f"\nGeplanter Neustart täglich um "
-            f"{SCHEDULED_RESTART_HOUR:02d}:{SCHEDULED_RESTART_MINUTE:02d} Uhr."
+            f"{cfg('neustart_zeit')} Uhr."
         )
     await update.message.reply_text(text)
 
@@ -1095,7 +1609,7 @@ async def poll_server_availability(app: Application):
                 # Während eines geplanten Stop/Update/Restore keine
                 # Fehlalarme auslösen - Status wird nicht mitgeschrieben,
                 # damit nach der Wartung sauber weiter verglichen wird.
-                await asyncio.sleep(POLL_INTERVAL)
+                await asyncio.sleep(cfg("pruef_intervall"))
                 continue
 
             info = await query_server()
@@ -1111,7 +1625,7 @@ async def poll_server_availability(app: Application):
             server_was_online = is_online
         except Exception as e:
             log.error("Fehler im Verfügbarkeits-Polling: %s", e)
-        await asyncio.sleep(POLL_INTERVAL)
+        await asyncio.sleep(cfg("pruef_intervall"))
 
 
 # --- Hintergrund-Task 2: Live-Log-Watcher -----------------------------------
@@ -1188,7 +1702,7 @@ async def watch_logs(app: Application):
                 record_log_issue(kind, line)
                 # Einzelmeldung nur für Fehler nach dem Start (nie für Warnungen
                 # und nie für Meldungen während des Starts)
-                if kind == "error" and not was_booting and ERROR_ALERTS_RUNTIME:
+                if kind == "error" and not was_booting and cfg("fehler_alarm"):
                     # Zeitstempel für den Vergleich entfernen, sonst ist jede
                     # Zeile "neu" und die Unterdrückung von Wiederholungen greift nie
                     normalized = ERROR_TIMESTAMP_RE.sub("[", line, count=1)
@@ -1205,15 +1719,31 @@ async def watch_logs(app: Application):
 
 # --- Hintergrund-Task 3: Automatisches Backup -------------------------------
 async def scheduled_backup(app: Application):
-    interval_seconds = BACKUP_INTERVAL_HOURS * 3600
     while True:
-        await asyncio.sleep(interval_seconds)
+        if not cfg("backup_aktiv"):
+            log.info("Automatisches Backup ist deaktiviert (/settings backup_aktiv an).")
+            await wait_or_change("backup", 86400)
+            continue
+
+        target = next_occurrence(cfg("backup_zeit"))
+        log.info("Nächstes automatisches Backup: %s", target)
+        if await wait_or_change("backup", seconds_until(target)):
+            continue  # Einstellung geändert: Zeitpunkt neu berechnen
+
+        if maintenance_mode:
+            log.info("Automatisches Backup übersprungen - Wartung läuft.")
+            await app.bot.send_message(
+                GROUP_CHAT_ID, "⏭ Automatisches Backup übersprungen, weil gerade ein Neustart/Update läuft."
+            )
+            continue
         try:
             path, size = await run_backup()
             size_mb = size / (1024 * 1024)
             await app.bot.send_message(
                 GROUP_CHAT_ID,
-                f"💾 Automatisches Backup erstellt: {os.path.basename(path)} ({size_mb:.1f} MB)",
+                f"💾 Automatisches Backup erstellt: `{os.path.basename(path)}` ({size_mb:.1f} MB)\n"
+                f"{last_retention_summary}",
+                parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as e:
             log.error("Automatisches Backup fehlgeschlagen: %s", e)
@@ -1222,24 +1752,27 @@ async def scheduled_backup(app: Application):
 
 # --- Hintergrund-Task 4: Geplante Neustarts ---------------------------------
 async def scheduled_restart_task(app: Application):
-    if not SCHEDULED_RESTART_ENABLED:
-        log.info("Geplante Neustarts sind deaktiviert (SCHEDULED_RESTART_ENABLED=false).")
-        return
-
     while True:
-        now = datetime.now()
-        target = now.replace(
-            hour=SCHEDULED_RESTART_HOUR, minute=SCHEDULED_RESTART_MINUTE,
-            second=0, microsecond=0,
-        )
-        if target <= now:
-            target += timedelta(days=1)
-        wait_seconds = (target - now).total_seconds()
-        log.info("Nächster geplanter Neustart um %s (in %.0fs)", target, wait_seconds)
-        await asyncio.sleep(wait_seconds)
+        if not cfg("neustart_aktiv"):
+            await wait_or_change("restart", 86400)
+            continue
+
+        target = next_occurrence(cfg("neustart_zeit"))
+        log.info("Nächster geplanter Neustart: %s", target)
+        if await wait_or_change("restart", seconds_until(target)):
+            continue  # Einstellung geändert: Zeitpunkt neu berechnen
+
+        global skip_next_restart
+        if skip_next_restart:
+            skip_next_restart = False
+            log.info("Geplanter Neustart auf Wunsch eines Admins übersprungen.")
+            await app.bot.send_message(
+                GROUP_CHAT_ID, "⏭ Der geplante Neustart wird heute auf Wunsch eines Admins übersprungen."
+            )
+            continue
 
         info = await query_server()
-        if SCHEDULED_RESTART_SKIP_IF_EMPTY and (info is None or info["players_online"] == 0):
+        if cfg("neustart_ueberspringen") and (info is None or info["players_online"] == 0):
             log.info("Geplanter Neustart übersprungen - niemand online.")
             continue
 
@@ -1247,7 +1780,7 @@ async def scheduled_restart_task(app: Application):
             await app.bot.send_message(GROUP_CHAT_ID, text)
 
         await notify("🕓 Geplanter täglicher Server-Neustart steht an.")
-        await perform_restart_sequence(SCHEDULED_RESTART_COUNTDOWN_SECONDS, notify)
+        await perform_restart_sequence(cfg("neustart_countdown"), notify)
 
 
 def bootstrap_active_sessions():
@@ -1331,12 +1864,16 @@ async def post_init(app: Application):
 
 def main():
     init_db()
+    load_settings()
     bootstrap_active_sessions()
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("spieler", cmd_spieler))
     app.add_handler(CommandHandler("error", cmd_error))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("backups", cmd_backups))
+    app.add_handler(CommandHandler("autorestart", cmd_autorestart))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("update", cmd_update))
